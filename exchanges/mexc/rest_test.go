@@ -955,9 +955,16 @@ func TestGetContractDepthInformation(t *testing.T) {
 	_, err := e.GetContractOrderbook(t.Context(), currency.EMPTYPAIR, 10)
 	require.ErrorIs(t, err, currency.ErrSymbolStringEmpty)
 
-	result, err := e.GetContractOrderbook(t.Context(), spotTradablePair, 2)
+	// A spot symbol is not a contract: the venue answers success=false and that must surface
+	// as an error rather than as a silently empty book
+	_, err = e.GetContractOrderbook(t.Context(), spotTradablePair, 2)
+	require.ErrorIs(t, err, errFuturesRequestUnsuccessful)
+
+	result, err := e.GetContractOrderbook(t.Context(), futuresTradablePair, 1000)
 	require.NoError(t, err)
-	assert.NotNil(t, result)
+	require.NotNil(t, result)
+	assert.NotEmpty(t, result.Bids, "bids must be unwrapped from the response envelope")
+	assert.NotEmpty(t, result.Asks, "asks must be unwrapped from the response envelope")
 }
 
 func TestGetDepthSnapshotOfContract(t *testing.T) {
