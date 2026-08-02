@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -49,6 +50,16 @@ const (
 	channelFPersonalADLLevel  = "personal.adl.level"
 	channelFPersonalRiskLimit = "personal.risk.limit"
 	channelFPositionMode      = "personal.position.mode"
+
+	// Ping response channel
+	channelFPong = "pong"
+
+	futuresSubscribeMethod   = "sub"
+	futuresUnsubscribeMethod = "unsub"
+
+	// defaultFuturesDepthLevels is used when a depth subscription carries no level count:
+	// the venue rejects depth.full without a limit
+	defaultFuturesDepthLevels = 20
 )
 
 var defaultFuturesSubscriptions = subscription.List{
@@ -57,7 +68,7 @@ var defaultFuturesSubscriptions = subscription.List{
 	{Enabled: true, Asset: asset.Futures, Channel: subscription.OrderbookChannel},
 	{Enabled: true, Asset: asset.Futures, Channel: subscription.CandlesChannel, Interval: kline.FifteenMin},
 
-	{Enabled: true, Asset: asset.Futures, Channel: subscription.MyTradesChannel, Authenticated: true},
+	// MEXC futures has no private trades channel: own fills arrive through personal.order.
 	{Enabled: true, Asset: asset.Futures, Channel: subscription.MyOrdersChannel, Authenticated: true},
 	{Enabled: true, Asset: asset.Futures, Channel: subscription.MyAccountChannel, Authenticated: true},
 }
@@ -124,53 +135,90 @@ func (e *Exchange) generateFuturesSubscriptions() (subscription.List, error) {
 
 // SubscribeFutures subscribes to a futures websocket channel
 func (e *Exchange) SubscribeFutures(ctx context.Context, conn websocket.Connection, subscriptions subscription.List) error {
-	return e.handleSubscriptionFuturesPayload(ctx, conn, subscriptions, "sub")
+	return e.handleSubscriptionFuturesPayload(ctx, conn, subscriptions, futuresSubscribeMethod)
 }
 
 // UnsubscribeFutures unsubscribes to a futures websocket channel
 func (e *Exchange) UnsubscribeFutures(ctx context.Context, conn websocket.Connection, subscriptions subscription.List) error {
-	return e.handleSubscriptionFuturesPayload(ctx, conn, subscriptions, "unsub")
+	return e.handleSubscriptionFuturesPayload(ctx, conn, subscriptions, futuresUnsubscribeMethod)
+}
+
+// isFuturesSymbolChannel reports whether a futures channel is subscribed per contract and
+// therefore requires a symbol in the subscription parameters
+func isFuturesSymbolChannel(channel string) bool {
+	return slices.Contains([]string{
+		channelFTicker, channelFDeal, channelFDepthFull, channelFKline,
+		channelFFundingRate, channelFIndexPrice, channelFFairPrice,
+	}, channel)
+}
+
+// futuresSubscriptionParam builds the per-contract subscription parameters for a channel
+func (e *Exchange) futuresSubscriptionParam(s *subscription.Subscription, pair currency.Pair) (*FWebsocketReqParam, error) {
+	fPair, err := e.FormatExchangeCurrency(pair, asset.Futures)
+	if err != nil {
+		return nil, err
+	}
+	param := &FWebsocketReqParam{Symbol: fPair.String()}
+	switch s.QualifiedChannel {
+	case channelFDepthFull:
+		param.Limit = s.Levels
+		if param.Limit <= 0 {
+			param.Limit = defaultFuturesDepthLevels
+		}
+	case channelFKline:
+		intervalString, err := ContractIntervalString(s.Interval)
+		if err != nil {
+			return nil, err
+		}
+		param.Interval = intervalString
+	}
+	return param, nil
+}
+
+// futuresSubscriptionPayloads builds the venue payloads for a subscription list. Per-contract
+// channels yield one payload per pair, each carrying the symbol: a payload without a symbol is
+// rejected by the venue and takes the connection down with it.
+func (e *Exchange) futuresSubscriptionPayloads(subscriptionItems subscription.List, method string) ([]*WsSubscriptionPayload, error) {
+	payloads := make([]*WsSubscriptionPayload, 0, len(subscriptionItems))
+	for x := range subscriptionItems {
+		s := subscriptionItems[x]
+		if s == nil {
+			continue
+		}
+		if !isFuturesSymbolChannel(s.QualifiedChannel) {
+			payloads = append(payloads, &WsSubscriptionPayload{Method: method + "." + s.QualifiedChannel})
+			continue
+		}
+		if len(s.Pairs) == 0 {
+			return nil, fmt.Errorf("%w: %s %s", currency.ErrCurrencyPairsEmpty, asset.Futures, s.QualifiedChannel)
+		}
+		for p := range s.Pairs {
+			param, err := e.futuresSubscriptionParam(s, s.Pairs[p])
+			if err != nil {
+				return nil, err
+			}
+			payloads = append(payloads, &WsSubscriptionPayload{Method: method + "." + s.QualifiedChannel, Param: param})
+		}
+	}
+	return payloads, nil
 }
 
 func (e *Exchange) handleSubscriptionFuturesPayload(ctx context.Context, conn websocket.Connection, subscriptionItems subscription.List, method string) error {
-	for x := range subscriptionItems {
-		switch subscriptionItems[x].Channel {
-		case channelFDeal, channelFTicker, channelFDepthFull, channelFKline, channelFFundingRate, channelFIndexPrice, channelFFairPrice:
-			var param *FWebsocketReqParam
-			for p := range subscriptionItems[x].Pairs {
-				switch subscriptionItems[x].QualifiedChannel {
-				case channelFDeal:
-					param = &FWebsocketReqParam{
-						Symbol:   subscriptionItems[x].Pairs[p].String(),
-						Compress: true,
-						Limit:    subscriptionItems[x].Levels,
-					}
-				case channelFKline:
-					intervalString, err := ContractIntervalString(subscriptionItems[x].Interval)
-					if err != nil {
-						return err
-					}
-					param = &FWebsocketReqParam{
-						Symbol:   subscriptionItems[x].Pairs[p].String(),
-						Interval: intervalString,
-					}
-				}
-				if err := conn.SendJSONMessage(ctx, request.UnAuth, &WsSubscriptionPayload{
-					Method: method + "." + subscriptionItems[x].QualifiedChannel,
-					Param:  param,
-				}); err != nil {
-					return err
-				}
-			}
-		default:
-			if err := conn.SendJSONMessage(ctx, request.UnAuth, &WsSubscriptionPayload{
-				Method: method + "." + subscriptionItems[x].QualifiedChannel,
-			}); err != nil {
-				return err
-			}
+	payloads, err := e.futuresSubscriptionPayloads(subscriptionItems, method)
+	if err != nil {
+		return err
+	}
+	for i := range payloads {
+		if err := conn.SendJSONMessage(ctx, request.UnAuth, payloads[i]); err != nil {
+			return err
 		}
 	}
-	return nil
+	// The subscription store is not updated by the transport: without this the manager
+	// reports ErrSubscriptionsNotAdded and tears the connection down.
+	if method == futuresUnsubscribeMethod {
+		return e.Websocket.RemoveSubscriptions(conn, subscriptionItems...)
+	}
+	return e.Websocket.AddSuccessfulSubscriptions(conn, subscriptionItems...)
 }
 
 // WsHandleFuturesData processed futures websocket data
@@ -191,6 +239,10 @@ func (e *Exchange) WsHandleFuturesData(ctx context.Context, conn websocket.Conne
 				Message: string(respRaw) + websocket.UnhandledMessage,
 			})
 		}
+	}
+	if resp.Channel == channelFPong {
+		// Answer to {"method":"ping"}; carries no payload and needs no routing.
+		return nil
 	}
 	cnlSplits := strings.Split(resp.Channel, ".")
 	switch strings.Join(cnlSplits[1:], ".") {
@@ -511,8 +563,10 @@ func (e *Exchange) processFuturesTicker(ctx context.Context, data []byte) error 
 		Last:         resp.LastPrice,
 		High:         resp.High24Price,
 		Low:          resp.Lower24Price,
-		Ask:          resp.MinAskPrice,
-		Bid:          resp.MaxBidPrice,
+		// Ask1/Bid1 are the best offer and bid. MinAskPrice/MaxBidPrice are the venue's
+		// price-limit band (e.g. last 14.022 -> band 11.222/16.833) and are not a BBO.
+		Ask:          resp.Ask1,
+		Bid:          resp.Bid1,
 		Volume:       resp.Volume24,
 		IndexPrice:   resp.IndexPrice,
 		Pair:         cp,
@@ -527,10 +581,20 @@ func (e *Exchange) processFuturesTickers(ctx context.Context, data []byte) error
 	if err := json.Unmarshal(data, &tickers); err != nil {
 		return err
 	}
+	// The tickers channel is a venue-wide broadcast: every contract arrives regardless of
+	// what is subscribed. Publishing all of them floods consumers with pairs the platform
+	// does not track, so only enabled futures pairs are forwarded.
+	enabledPairs, err := e.GetEnabledPairs(asset.Futures)
+	if err != nil {
+		return nil //nolint:nilerr // futures not enabled: nothing to publish, not a stream error
+	}
 	for t := range tickers {
 		cp, err := currency.NewPairFromString(tickers[t].Symbol)
 		if err != nil {
 			return err
+		}
+		if !enabledPairs.Contains(cp, true) {
+			continue
 		}
 		if err := e.Websocket.DataHandler.Send(ctx, &ticker.Price{
 			ExchangeName: e.Name,
