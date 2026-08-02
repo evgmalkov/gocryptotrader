@@ -57,6 +57,9 @@ const (
 	futuresSubscribeMethod   = "sub"
 	futuresUnsubscribeMethod = "unsub"
 
+	// futuresPingDelay keeps the contract connection alive; the venue closes an idle one
+	futuresPingDelay = time.Second * 15
+
 	// defaultFuturesDepthLevels is used when a depth subscription carries no level count:
 	// the venue rejects depth.full without a limit
 	defaultFuturesDepthLevels = 20
@@ -89,7 +92,9 @@ func (e *Exchange) WsFuturesConnect(ctx context.Context, conn websocket.Connecti
 	conn.SetupPingHandler(request.UnAuth, websocket.PingHandler{
 		Message:     []byte(`{"method": "ping"}`),
 		MessageType: gws.TextMessage,
-		Delay:       time.Minute * 15,
+		// The venue drops an idle contract connection after roughly a minute: measured as
+		// close 1005 every ~70s with the previous 15 minute delay
+		Delay: futuresPingDelay,
 	})
 	return nil
 }

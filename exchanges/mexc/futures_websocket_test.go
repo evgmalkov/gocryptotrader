@@ -1,13 +1,16 @@
 package mexc
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/thrasher-corp/gocryptotrader/currency"
+	"github.com/thrasher-corp/gocryptotrader/exchange/websocket"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/asset"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/kline"
+	"github.com/thrasher-corp/gocryptotrader/exchanges/request"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/subscription"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/ticker"
 	testexch "github.com/thrasher-corp/gocryptotrader/internal/testing/exchange"
@@ -119,6 +122,37 @@ func TestFuturesSubscriptionPayloads(t *testing.T) {
 		{Asset: asset.Futures, Channel: subscription.CandlesChannel, QualifiedChannel: channelFKline, Interval: kline.SixMonth, Pairs: pairs[:1]},
 	}, futuresSubscribeMethod)
 	require.Error(t, err, "an unsupported interval must abort payload construction")
+}
+
+// captureConn records the payloads a subscription attempt puts on the wire
+type captureConn struct {
+	websocket.Connection
+	sent []any
+}
+
+func (c *captureConn) SendJSONMessage(_ context.Context, _ request.EndpointLimit, payload any) error {
+	c.sent = append(c.sent, payload)
+	return nil
+}
+
+func TestSubscribeFuturesRegistersSubscriptions(t *testing.T) {
+	t.Parallel()
+	ex := newFuturesTestExchange(t)
+	conn := &captureConn{}
+	subs := subscription.List{
+		{Asset: asset.Futures, Channel: subscription.TickerChannel, QualifiedChannel: channelFTicker, Pairs: currency.Pairs{currency.NewPair(currency.BTC, currency.USDT)}},
+	}
+	require.NoError(t, ex.SubscribeFutures(t.Context(), conn, subs))
+	require.Len(t, conn.sent, 1, "one payload per subscribed contract must reach the wire")
+
+	// The manager tears the connection down with ErrSubscriptionsNotAdded unless the
+	// subscriber registers what it subscribed to
+	registered := ex.Websocket.GetSubscriptions()
+	require.Len(t, registered, 1, "the subscription must be registered with the manager")
+	assert.Equal(t, channelFTicker, registered[0].QualifiedChannel)
+
+	require.NoError(t, ex.UnsubscribeFutures(t.Context(), conn, subs))
+	assert.Empty(t, ex.Websocket.GetSubscriptions(), "unsubscribing must deregister the subscription")
 }
 
 func TestGenerateFuturesSubscriptionsUsesVenueChannels(t *testing.T) {
