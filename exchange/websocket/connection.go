@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
-	"compress/zlib"
 	"context"
 	"errors"
 	"fmt"
@@ -102,6 +101,11 @@ type ConnectionSetup struct {
 	// MessageFilter defines the criteria used to match messages to a specific connection.
 	// The filter enables precise routing and handling of messages for distinct connection contexts.
 	MessageFilter any
+	// BinaryMessageDecoder optionally replaces the default binary frame handling for this
+	// connection. The default assumes every non-GZIP binary frame is a raw DEFLATE stream,
+	// which does not hold for every venue: some send uncompressed payloads (e.g. protobuf).
+	// Leaving this nil keeps the default behaviour, so venues that do not set it are unaffected.
+	BinaryMessageDecoder func([]byte) ([]byte, error)
 }
 
 // Inspector is used to verify messages via SendMessageReturnResponsesWithInspection
@@ -135,6 +139,7 @@ type connection struct {
 	ResponseMaxLimit     time.Duration
 	Traffic              chan struct{}
 	readMessageErrors    chan error
+	binaryMessageDecoder func([]byte) ([]byte, error)
 }
 
 // Dial sets proxy urls and then connects to the websocket
@@ -319,40 +324,27 @@ func (c *connection) ReadMessage() Response {
 
 // parseBinaryResponse parses a websocket binary response into a usable byte array
 func (c *connection) parseBinaryResponse(resp []byte) ([]byte, error) {
-	if len(resp) == 0 {
-		return nil, fmt.Errorf("%w: empty binary response", common.ErrNoResponse)
+	// An exchange whose binary frames are not covered by the default assumption below
+	// supplies its own decoder via ConnectionSetup.BinaryMessageDecoder. When unset the
+	// behaviour is unchanged, so exchanges that do not opt in are unaffected.
+	if c.binaryMessageDecoder != nil {
+		return c.binaryMessageDecoder(resp)
 	}
 	var reader io.ReadCloser
 	var err error
-	switch {
-	case len(resp) >= 2 && resp[0] == 31 && resp[1] == 139: // Detect GZIP
+	if len(resp) >= 2 && resp[0] == 31 && resp[1] == 139 { // Detect GZIP
 		reader, err = gzip.NewReader(bytes.NewReader(resp))
 		if err != nil {
 			return nil, err
 		}
-		standardMessage, err := io.ReadAll(reader)
-		if err != nil {
-			return nil, err
-		}
-		return standardMessage, reader.Close()
-	case len(resp) > 2 && (resp[0]&0x0F == 8):
-		// Possible DEFLATE (zlib) compressed — used by permessage-deflate
-		zr, zerr := zlib.NewReader(bytes.NewReader(resp))
-		if zerr != nil {
-			// fallback: raw deflate stream without zlib header
-			fr := flate.NewReader(bytes.NewReader(resp))
-			reader = io.NopCloser(fr)
-		} else {
-			reader = zr
-		}
-		standardMessage, err := io.ReadAll(reader)
-		if err != nil {
-			return nil, err
-		}
-		return standardMessage, reader.Close()
-	default:
-		return resp, nil
+	} else {
+		reader = flate.NewReader(bytes.NewReader(resp))
 	}
+	standardMessage, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+	return standardMessage, reader.Close()
 }
 
 // Shutdown shuts down and closes specific connection
