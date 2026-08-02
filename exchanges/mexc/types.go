@@ -774,6 +774,14 @@ type ContractOrderbook struct {
 	Timestamp types.Time                       `json:"timestamp"`
 }
 
+// ContractOrderbookResponse holds the envelope the futures API wraps depth data in
+type ContractOrderbookResponse struct {
+	Code    int64              `json:"code"`
+	Success bool               `json:"success"`
+	Message string             `json:"message"`
+	Data    *ContractOrderbook `json:"data"`
+}
+
 // ContractOrderbookWithDepth holds orderbook depth details
 type ContractOrderbookWithDepth struct {
 	Code    int64 `json:"code"`

@@ -2,6 +2,7 @@ package mexc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -19,6 +20,9 @@ import (
 	"github.com/thrasher-corp/gocryptotrader/exchanges/order"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/request"
 )
+
+// errFuturesRequestUnsuccessful is returned when the futures API answers with success=false
+var errFuturesRequestUnsuccessful = errors.New("futures request unsuccessful")
 
 // GetFuturesContracts retrieves list of detailed futures contract
 func (e *Exchange) GetFuturesContracts(ctx context.Context, symbol currency.Pair) (*FuturesContractsDetail, error) {
@@ -45,8 +49,19 @@ func (e *Exchange) GetContractOrderbook(ctx context.Context, symbol currency.Pai
 	if limit > 0 {
 		params.Set("limit", strconv.FormatInt(limit, 10))
 	}
-	var resp *ContractOrderbook
-	return resp, e.SendHTTPRequest(ctx, exchange.RestFutures, getContractDepthInfoEPL, http.MethodGet, "contract/depth/"+symbol.String(), params, nil, &resp)
+	// The futures API wraps depth data in a {success, code, data} envelope; unmarshalling
+	// the payload straight into ContractOrderbook silently yields an empty book.
+	var resp *ContractOrderbookResponse
+	if err := e.SendHTTPRequest(ctx, exchange.RestFutures, getContractDepthInfoEPL, http.MethodGet, "contract/depth/"+symbol.String(), params, nil, &resp); err != nil {
+		return nil, err
+	}
+	if resp == nil {
+		return nil, common.ErrNoResponse
+	}
+	if !resp.Success || resp.Data == nil {
+		return nil, fmt.Errorf("%w: code: %d, msg: %s", errFuturesRequestUnsuccessful, resp.Code, resp.Message)
+	}
+	return resp.Data, nil
 }
 
 // GetDepthSnapshotOfContract retrieves the order book details and depth information

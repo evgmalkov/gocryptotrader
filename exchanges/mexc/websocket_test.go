@@ -75,9 +75,10 @@ func TestChannelName(t *testing.T) {
 		channel  string
 		expected string
 	}{
-		{asset.Futures, subscription.TickerChannel, channelFTickers},
+		{asset.Futures, subscription.TickerChannel, channelFTicker},
 		{asset.Futures, subscription.OrderbookChannel, channelFDepthFull},
-		{asset.Futures, subscription.MyTradesChannel, channelFDeal},
+		{asset.Futures, subscription.AllTradesChannel, channelFDeal},
+		{asset.Futures, subscription.CandlesChannel, channelFKline},
 		{asset.Futures, subscription.MyOrdersChannel, channelFPersonalOrder},
 		{asset.Futures, subscription.MyAccountChannel, channelFPersonalAssets},
 		{asset.Spot, subscription.TickerChannel, channelBookTiker},
@@ -91,6 +92,8 @@ func TestChannelName(t *testing.T) {
 	} {
 		assert.Equalf(t, tc.expected, channelName(&subscription.Subscription{Asset: tc.asset, Channel: tc.channel}), "channelName should return correct channel for %s %s", tc.asset, tc.channel)
 	}
+	assert.NotEqual(t, channelFTickers, channelName(&subscription.Subscription{Asset: asset.Futures, Channel: subscription.TickerChannel}),
+		"futures ticker must not resolve to the venue-wide broadcast channel")
 }
 
 // wsPushFrame builds a protobuf push frame the way MEXC sends it: the qualified channel is the

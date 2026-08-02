@@ -47,6 +47,8 @@ const (
 	// subscription without it ("Not Subscribed successfully! ... Reason: Blocked!" — measured live).
 	// It only shifts the rate fields we do not consume; price/high/low/volume are timezone-agnostic.
 	miniTickerTimezone = "UTC+8"
+	// wsPongMessage is the msg field of the spot ping acknowledgement
+	wsPongMessage = "PONG"
 )
 
 // orderbookSnapshotLoadedPairs and syncOrderbookPairsLock holds list of symbols and if these instruments snapshot orderbook detail is loaded, and corresponding lock
@@ -106,11 +108,15 @@ func channelName(s *subscription.Subscription) string {
 	case asset.Futures:
 		switch s.Channel {
 		case subscription.TickerChannel:
-			return channelFTickers
+			// channelFTicker is per-symbol; channelFTickers is a broadcast of every
+			// contract on the venue and must not be used for a pair subscription.
+			return channelFTicker
 		case subscription.OrderbookChannel:
 			return channelFDepthFull
-		case subscription.MyTradesChannel:
+		case subscription.AllTradesChannel:
 			return channelFDeal
+		case subscription.CandlesChannel:
+			return channelFKline
 		case subscription.MyOrdersChannel:
 			return channelFPersonalOrder
 		case subscription.MyAccountChannel:
@@ -275,9 +281,20 @@ func wsSendTime(w *mexc_proto_types.PushDataV3ApiWrapper) time.Time {
 	return time.Now()
 }
 
+// isSpotPongMessage reports whether the payload is the acknowledgement of {"method":"PING"}.
+// It arrives as {"id":0,"code":0,"msg":"PONG"}: id 0 matches no pending request, so without
+// this check it would be reported as an unhandled message.
+func isSpotPongMessage(respRaw []byte) bool {
+	msg, err := jsonparser.GetString(respRaw, "msg")
+	return err == nil && strings.EqualFold(msg, wsPongMessage)
+}
+
 // WsHandleData will read websocket raw data and pass to appropriate handler
 func (e *Exchange) WsHandleData(ctx context.Context, conn websocket.Connection, respRaw []byte) error {
 	if strings.HasPrefix(string(respRaw), "{") {
+		if isSpotPongMessage(respRaw) {
+			return nil
+		}
 		if id, err := jsonparser.GetInt(respRaw, "id"); err == nil {
 			if !conn.IncomingWithData(id, respRaw) {
 				return e.Websocket.DataHandler.Send(ctx, websocket.UnhandledMessageWarning{
