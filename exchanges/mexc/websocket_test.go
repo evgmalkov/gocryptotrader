@@ -5,9 +5,13 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/asset"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/kline"
+	"github.com/thrasher-corp/gocryptotrader/exchanges/mexc/mexc_proto_types"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/subscription"
+	"github.com/thrasher-corp/gocryptotrader/exchanges/ticker"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestWsHandle(t *testing.T) {
@@ -87,6 +91,134 @@ func TestChannelName(t *testing.T) {
 	} {
 		assert.Equalf(t, tc.expected, channelName(&subscription.Subscription{Asset: tc.asset, Channel: tc.channel}), "channelName should return correct channel for %s %s", tc.asset, tc.channel)
 	}
+}
+
+// wsPushFrame builds a protobuf push frame the way MEXC sends it: the qualified channel is the
+// first field, which is also what WsHandleData routes on.
+func wsPushFrame(tb testing.TB, channel, symbol string, sendTime int64, body isPushBody) []byte {
+	tb.Helper()
+	w := &mexc_proto_types.PushDataV3ApiWrapper{
+		Channel:  channel,
+		Symbol:   &symbol,
+		SendTime: &sendTime,
+	}
+	switch b := body.(type) {
+	case *mexc_proto_types.PublicAggreBookTickerV3Api:
+		w.Body = &mexc_proto_types.PushDataV3ApiWrapper_PublicAggreBookTicker{PublicAggreBookTicker: b}
+	case *mexc_proto_types.PublicMiniTickerV3Api:
+		w.Body = &mexc_proto_types.PushDataV3ApiWrapper_PublicMiniTicker{PublicMiniTicker: b}
+	default:
+		tb.Fatalf("unsupported body type %T", body)
+	}
+	raw, err := proto.Marshal(w)
+	require.NoError(tb, err, "proto.Marshal must not error")
+	return raw
+}
+
+type isPushBody any
+
+// drainTickers returns every ticker.Price relayed to the data handler so far
+func drainTickers(tb testing.TB) []*ticker.Price {
+	tb.Helper()
+	var out []*ticker.Price
+	for {
+		select {
+		case p := <-e.Websocket.DataHandler.C:
+			if tick, ok := p.Data.(*ticker.Price); ok {
+				out = append(out, tick)
+			}
+		default:
+			return out
+		}
+	}
+}
+
+// TestWsSpotTickerFromBookTicker asserts the spot best bid/offer reaches the ticker and not only
+// the orderbook: the websocket ticker used to be silently empty (zero SPOT TICKER lines in 15 min).
+func TestWsSpotTickerFromBookTicker(t *testing.T) {
+	drainTickers(t)
+	raw := wsPushFrame(t, "spot@"+channelBookTiker+"@100ms@BTCUSDT", "BTCUSDT", 1736412092433,
+		&mexc_proto_types.PublicAggreBookTickerV3Api{
+			BidPrice: "93387.28", BidQuantity: "3.73485",
+			AskPrice: "93387.29", AskQuantity: "7.669875",
+		})
+	require.NoError(t, e.WsHandleData(t.Context(), nil, raw), "WsHandleData must not error")
+
+	ticks := drainTickers(t)
+	require.Len(t, ticks, 1, "exactly one ticker must be published")
+	got := ticks[0]
+	assert.Equal(t, 93387.28, got.Bid, "Bid should be correct")
+	assert.Equal(t, 3.73485, got.BidSize, "BidSize should be correct")
+	assert.Equal(t, 93387.29, got.Ask, "Ask should be correct")
+	assert.Equal(t, 7.669875, got.AskSize, "AskSize should be correct")
+	assert.Equal(t, asset.Spot, got.AssetType, "AssetType should be correct")
+	assert.Equal(t, e.Name, got.ExchangeName, "ExchangeName should be correct")
+	assert.Equal(t, int64(1736412092433), got.LastUpdated.UnixMilli(), "LastUpdated should come from the exchange send time")
+}
+
+// TestWsSpotTickerFromMiniTicker asserts last/high/low/volume arrive over the websocket and that the
+// two spot ticker channels merge instead of blanking each other's fields.
+func TestWsSpotTickerFromMiniTicker(t *testing.T) {
+	drainTickers(t)
+	bookRaw := wsPushFrame(t, "spot@"+channelBookTiker+"@100ms@BTCUSDT", "BTCUSDT", 1736412092433,
+		&mexc_proto_types.PublicAggreBookTickerV3Api{
+			BidPrice: "93387.28", BidQuantity: "3.73485",
+			AskPrice: "93387.29", AskQuantity: "7.669875",
+		})
+	require.NoError(t, e.WsHandleData(t.Context(), nil, bookRaw), "WsHandleData must not error")
+
+	miniRaw := wsPushFrame(t, "spot@"+channelMiniTickerV3+"@BTCUSDT@"+miniTickerTimezone, "BTCUSDT", 1736412092500,
+		&mexc_proto_types.PublicMiniTickerV3Api{
+			Symbol: "BTCUSDT", Price: "93390.11", High: "94000.5", Low: "92000.25",
+			Volume: "323169.867864", Quantity: "12058672.07",
+		})
+	require.NoError(t, e.WsHandleData(t.Context(), nil, miniRaw), "WsHandleData must not error")
+
+	ticks := drainTickers(t)
+	require.Len(t, ticks, 2, "both channels must publish a ticker")
+	got := ticks[1]
+	assert.Equal(t, 93390.11, got.Last, "Last should be correct")
+	assert.Equal(t, 94000.5, got.High, "High should be correct")
+	assert.Equal(t, 92000.25, got.Low, "Low should be correct")
+	assert.Equal(t, 12058672.07, got.Volume, "Volume should be the base asset volume (miniTicker quantity)")
+	assert.Equal(t, 323169.867864, got.QuoteVolume, "QuoteVolume should be the quote volume (miniTicker volume)")
+	assert.Equal(t, 93387.28, got.Bid, "Bid from the bookTicker channel must survive a miniTicker update")
+	assert.Equal(t, 93387.29, got.Ask, "Ask from the bookTicker channel must survive a miniTicker update")
+	assert.Equal(t, int64(1736412092500), got.LastUpdated.UnixMilli(), "LastUpdated should come from the exchange send time")
+}
+
+func TestWsHandleDataShortChannel(t *testing.T) {
+	t.Parallel()
+	assert.NoError(t, e.WsHandleData(t.Context(), nil, []byte("no-separator-here")), "a frame without channel separators must not panic")
+}
+
+func TestChannelSuffix(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, "@"+miniTickerTimezone, channelSuffix(channelMiniTickerV3), "miniTicker requires a timezone suffix")
+	assert.Empty(t, channelSuffix(channelBookTiker), "other channels take no suffix")
+}
+
+func TestSubscriptionAccepted(t *testing.T) {
+	t.Parallel()
+	const ch = "spot@public.miniTicker.v3.api.pb@BTCUSDT@UTC+8"
+	assert.True(t, subscriptionAccepted("SUBSCRIPTION", ch, ch), "an echoed channel means accepted")
+	assert.False(t, subscriptionAccepted("SUBSCRIPTION", ch, "Not Subscribed successfully! ["+ch+"].  Reason： Blocked! "), "a rejection carrying code 0 must not count as accepted")
+	assert.True(t, subscriptionAccepted("UNSUBSCRIPTION", ch, "no subscription"), "unsubscribe responses are not channel echoes")
+}
+
+func TestGenerateSubscriptionsIncludesMiniTicker(t *testing.T) {
+	t.Parallel()
+	subs, err := e.generateSubscriptions()
+	require.NoError(t, err, "generateSubscriptions must not error")
+	var found bool
+	for _, s := range subs {
+		if s.Channel != channelMiniTickerV3 {
+			continue
+		}
+		found = true
+		assert.Equal(t, "spot@"+channelMiniTickerV3+"@BTCUSDT@"+miniTickerTimezone, s.QualifiedChannel, "miniTicker must carry the mandatory timezone suffix; MEXC blocks the subscription without it")
+	}
+	assert.True(t, found, "the spot miniTicker channel must be subscribed")
 }
 
 func TestIsFutures(t *testing.T) {
