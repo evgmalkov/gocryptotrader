@@ -743,7 +743,7 @@ func (e *Exchange) SubmitOrder(ctx context.Context, s *order.Submit) (*order.Sub
 		}
 		var ordStatus order.Status
 		if result.Status != "" {
-			ordStatus, err = order.StringToOrderStatus(result.Status)
+			ordStatus, err = orderStatusFromString(result.Status)
 			if err != nil {
 				return nil, err
 			}
@@ -945,7 +945,7 @@ func (e *Exchange) GetOrderInfo(ctx context.Context, orderID string, pair curren
 		}
 		var oStatus order.Status
 		if result.Status != "" {
-			oStatus, err = order.StringToOrderStatus(result.Status)
+			oStatus, err = orderStatusFromString(result.Status)
 			if err != nil {
 				return nil, err
 			}
@@ -1616,4 +1616,18 @@ func (e *Exchange) UpdateOrderExecutionLimits(ctx context.Context, assetType ass
 		return fmt.Errorf("%w: %v", asset.ErrNotSupported, assetType)
 	}
 	return nil
+}
+
+// orderStatusFromString переводит статус ордера MEXC в общий order.Status.
+//
+// MEXC отдаёт "PARTIALLY_CANCELED", которого нет в общем словаре order.StringToOrderStatus.
+// Знание об этом написании принадлежит адаптеру площадки, а не общему парсеру: правка общего
+// словаря изменила бы поведение для ВСЕХ бирж ради одной (ADR-218 GCTU-29). Тот же маппинг
+// уже выполняется по месту в GetActiveOrders/GetOrderHistory — здесь он вынесен в одну точку.
+// Остальные написания делегируются общему парсеру без изменений.
+func orderStatusFromString(status string) (order.Status, error) {
+	if status == "PARTIALLY_CANCELED" {
+		return order.PartiallyCancelled, nil
+	}
+	return order.StringToOrderStatus(status)
 }
