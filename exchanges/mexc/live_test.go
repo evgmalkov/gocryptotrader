@@ -10,6 +10,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/thrasher-corp/gocryptotrader/exchange/accounts"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/asset"
 	testexch "github.com/thrasher-corp/gocryptotrader/internal/testing/exchange"
 )
@@ -25,7 +26,7 @@ func TestMain(m *testing.M) {
 	if apiKey != "" && apiSecret != "" {
 		e.API.AuthenticatedSupport = true
 		e.API.AuthenticatedWebsocketSupport = true
-		e.SetCredentials(apiKey, apiSecret, "", "", "", "")
+		e.SetCredentials(&accounts.Credentials{Key: apiKey, Secret: apiSecret})
 		e.Websocket.SetCanUseAuthenticatedEndpoints(true)
 	}
 	if err := populateTradablePairs(); err != nil {

@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/thrasher-corp/gocryptotrader/currency"
+	"github.com/thrasher-corp/gocryptotrader/exchange/accounts"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/asset"
 	testexch "github.com/thrasher-corp/gocryptotrader/internal/testing/exchange"
 )
@@ -18,7 +19,7 @@ func newSignedTestExchange(t *testing.T, handler http.Handler) *Exchange {
 	t.Helper()
 	ex := new(Exchange)
 	require.NoError(t, testexch.Setup(ex), "test exchange Setup must not error")
-	ex.SetCredentials("mock", "tester", "", "", "", "")
+	ex.SetCredentials(&accounts.Credentials{Key: "mock", Secret: "tester"})
 	ex.GetBase().SkipAuthCheck = true
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
