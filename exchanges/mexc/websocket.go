@@ -32,6 +32,7 @@ const (
 	spotWebsocketURL = "wss://wbs-api.mexc.com/ws"
 
 	channelBookTiker            = "public.aggre.bookTicker.v3.api.pb"
+	channelMiniTickerV3         = "public.miniTicker.v3.api.pb"
 	channelAggregateDepthV3     = "public.aggre.depth.v3.api.pb"
 	channelAggreDealsV3         = "public.aggre.deals.v3.api.pb"
 	channelKlineV3              = "public.kline.v3.api.pb"
@@ -41,6 +42,11 @@ const (
 	channelPrivateDealsV3       = "private.deals.v3.api.pb"
 	channelPrivateOrdersAPI     = "private.orders.v3.api.pb"
 	channelIncreaseDepthBatchV3 = "public.increase.depth.batch.v3.api.pb"
+
+	// miniTickerTimezone is a mandatory suffix of the spot miniTicker channel: MEXC rejects the
+	// subscription without it ("Not Subscribed successfully! ... Reason: Blocked!" — measured live).
+	// It only shifts the rate fields we do not consume; price/high/low/volume are timezone-agnostic.
+	miniTickerTimezone = "UTC+8"
 )
 
 // orderbookSnapshotLoadedPairs and syncOrderbookPairsLock holds list of symbols and if these instruments snapshot orderbook detail is loaded, and corresponding lock
@@ -139,6 +145,10 @@ var defaultSubscriptions = subscription.List{
 	{Enabled: true, Asset: asset.Spot, Channel: subscription.OrderbookChannel, Levels: 5},
 	{Enabled: true, Asset: asset.Spot, Channel: subscription.CandlesChannel, Interval: kline.FifteenMin},
 	{Enabled: true, Asset: asset.Spot, Channel: subscription.TickerChannel, Interval: kline.HundredMilliseconds},
+	// bookTicker (above) carries only the best bid/offer; miniTicker carries last/high/low/volume.
+	// Both feed the same ticker.Price: without the second one the websocket ticker would suppress
+	// the REST ticker sync and freeze last/high/low/volume at their last polled value.
+	{Enabled: true, Asset: asset.Spot, Channel: channelMiniTickerV3},
 	{Enabled: true, Asset: asset.Spot, Channel: subscription.AllTradesChannel, Interval: kline.HundredMilliseconds},
 
 	{Enabled: true, Asset: asset.Spot, Channel: subscription.MyTradesChannel, Authenticated: true},
@@ -156,6 +166,7 @@ func (e *Exchange) GetSubscriptionTemplate(_ *subscription.Subscription) (*templ
 	return template.New("master.tmpl").
 		Funcs(template.FuncMap{
 			"channelName":       channelName,
+			"channelSuffix":     channelSuffix,
 			"assetTypeToString": assetTypeToString,
 			"wsIntervalString":  wsIntervalString,
 			"isSymbolChannel":   isSymbolChannel,
@@ -177,6 +188,26 @@ func isSymbolChannel(channel string) bool {
 	return !slices.Contains([]string{channelAccountV3, channelPrivateDealsV3, channelPrivateOrdersAPI}, channel)
 }
 
+// channelSuffix returns the trailing element a channel requires after the symbol, if any
+func channelSuffix(channel string) string {
+	if channel == channelMiniTickerV3 {
+		return "@" + miniTickerTimezone
+	}
+	return ""
+}
+
+// subscriptionAccepted reports whether MEXC actually accepted the subscription. MEXC answers a
+// rejected subscription with code 0 and an error text in msg (measured live:
+// `code=0 msg="Not Subscribed successfully! [<channel>]. Reason： Blocked!"`), so the code alone
+// cannot distinguish success from failure and a rejected channel would be registered as live.
+// An accepted request echoes the qualified channel back verbatim.
+func subscriptionAccepted(method, qualifiedChannel, msg string) bool {
+	if method != "SUBSCRIPTION" {
+		return true
+	}
+	return msg == qualifiedChannel
+}
+
 func (e *Exchange) handleSubscription(ctx context.Context, conn websocket.Connection, method string, subs subscription.List) error {
 	var successfulSubscriptions, failedSubscriptions subscription.List
 	for s := range subs {
@@ -192,7 +223,7 @@ func (e *Exchange) handleSubscription(ctx context.Context, conn websocket.Connec
 		var resp *WsSubscriptionResponse
 		if err := json.Unmarshal(data, &resp); err != nil {
 			return err
-		} else if resp.Code != 0 {
+		} else if resp.Code != 0 || !subscriptionAccepted(method, subs[s].QualifiedChannel, resp.Message) {
 			failedSubscriptions = append(failedSubscriptions, subs[s])
 		} else {
 			successfulSubscriptions = append(successfulSubscriptions, subs[s])
@@ -202,6 +233,46 @@ func (e *Exchange) handleSubscription(ctx context.Context, conn websocket.Connec
 		return err
 	}
 	return e.Websocket.AddSuccessfulSubscriptions(conn, successfulSubscriptions...)
+}
+
+// wsUpdateSpotTicker merges a partial spot ticker update into the cached ticker and publishes it.
+// MEXC splits the spot ticker over two channels — bookTicker carries the best bid/offer only and
+// miniTicker carries last/high/low/volume — so each update must be applied on top of the current
+// ticker instead of replacing it, otherwise every channel would blank the other one's fields.
+func (e *Exchange) wsUpdateSpotTicker(ctx context.Context, cp currency.Pair, updated time.Time, apply func(*ticker.Price)) error {
+	tick, err := e.GetCachedTicker(cp, asset.Spot)
+	if err != nil {
+		tick = &ticker.Price{Pair: cp, ExchangeName: e.Name, AssetType: asset.Spot}
+	}
+	apply(tick)
+	tick.LastUpdated = updated
+	if err := ticker.ProcessTicker(tick); err != nil {
+		return err
+	}
+	return e.Websocket.DataHandler.Send(ctx, tick)
+}
+
+// parseOptionalFloat parses a numeric field which the exchange may omit entirely
+func parseOptionalFloat(v string) (float64, error) {
+	if v == "" {
+		return 0, nil
+	}
+	return strconv.ParseFloat(v, 64)
+}
+
+// setIfNonZero keeps the previously known value when an update omits the field
+func setIfNonZero(dst *float64, v float64) {
+	if v != 0 {
+		*dst = v
+	}
+}
+
+// wsSendTime returns the exchange send time of a push frame, falling back to local time when absent
+func wsSendTime(w *mexc_proto_types.PushDataV3ApiWrapper) time.Time {
+	if st := w.GetSendTime(); st != 0 {
+		return time.UnixMilli(st)
+	}
+	return time.Now()
 }
 
 // WsHandleData will read websocket raw data and pass to appropriate handler
@@ -218,6 +289,11 @@ func (e *Exchange) WsHandleData(ctx context.Context, conn websocket.Connection, 
 		return nil
 	}
 	dataSplit := strings.Split(string(respRaw), "@")
+	if len(dataSplit) < 3 {
+		return e.Websocket.DataHandler.Send(ctx, websocket.UnhandledMessageWarning{
+			Message: string(respRaw) + websocket.UnhandledMessage,
+		})
+	}
 	switch dataSplit[1] {
 	case channelBookTiker:
 		result := &mexc_proto_types.PushDataV3ApiWrapper{
@@ -264,14 +340,61 @@ func (e *Exchange) WsHandleData(ctx context.Context, conn websocket.Connection, 
 			syncOrderbookPairsLock.Lock()
 			orderbookSnapshotLoadedPairs[dataSplit[2]] = true
 			syncOrderbookPairsLock.Unlock()
-			return nil
-		}
-		return e.Websocket.Orderbook.Update(&orderbook.Update{
+		} else if err := e.Websocket.Orderbook.Update(&orderbook.Update{
 			Pair:       cp,
 			Asset:      asset.Spot,
 			Asks:       []orderbook.Level{ask},
 			Bids:       []orderbook.Level{bid},
 			UpdateTime: time.Now(),
+		}); err != nil {
+			return err
+		}
+		// The best bid/offer is a ticker fact as much as an orderbook one: publishing it only as an
+		// orderbook update left the websocket ticker empty and the REST poll the sole ticker path.
+		return e.wsUpdateSpotTicker(ctx, cp, wsSendTime(result), func(t *ticker.Price) {
+			t.Bid, t.BidSize = bid.Price, bid.Amount
+			t.Ask, t.AskSize = ask.Price, ask.Amount
+		})
+	case channelMiniTickerV3:
+		result := &mexc_proto_types.PushDataV3ApiWrapper{
+			Body: &mexc_proto_types.PushDataV3ApiWrapper_PublicMiniTicker{},
+		}
+		if err := proto.Unmarshal(respRaw, result); err != nil {
+			return err
+		}
+		body := result.GetPublicMiniTicker()
+		cp, err := e.MatchSymbolWithAvailablePairs(body.Symbol, asset.Spot, false)
+		if err != nil {
+			return err
+		}
+		last, err := parseOptionalFloat(body.Price)
+		if err != nil {
+			return err
+		}
+		high, err := parseOptionalFloat(body.High)
+		if err != nil {
+			return err
+		}
+		low, err := parseOptionalFloat(body.Low)
+		if err != nil {
+			return err
+		}
+		// Measured against GET /api/v3/ticker/24hr for KASUSDT: miniTicker `quantity` is the base
+		// asset volume and `volume` is the quote volume — the opposite of the REST field naming.
+		baseVolume, err := parseOptionalFloat(body.Quantity)
+		if err != nil {
+			return err
+		}
+		quoteVolume, err := parseOptionalFloat(body.Volume)
+		if err != nil {
+			return err
+		}
+		return e.wsUpdateSpotTicker(ctx, cp, wsSendTime(result), func(t *ticker.Price) {
+			setIfNonZero(&t.Last, last)
+			setIfNonZero(&t.High, high)
+			setIfNonZero(&t.Low, low)
+			setIfNonZero(&t.Volume, baseVolume)
+			setIfNonZero(&t.QuoteVolume, quoteVolume)
 		})
 	case channelAggregateDepthV3:
 		result := mexc_proto_types.PushDataV3ApiWrapper{
@@ -726,7 +849,7 @@ const subTplText = `
 					{{- end }}
 				{{- else }}
 					{{- range $p := $pairs -}}
-						{{- assetTypeToString $asset }}@{{- $name -}}@{{- formatPair $p $asset }}
+						{{- assetTypeToString $asset }}@{{- $name -}}@{{- formatPair $p $asset }}{{- channelSuffix $name }}
 						{{- $.PairSeparator }}
 					{{- end }}
 				{{- end }}
