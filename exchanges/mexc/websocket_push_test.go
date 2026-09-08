@@ -67,8 +67,11 @@ func TestWsHandleAggreDeals(t *testing.T) {
 	assert.Equal(t, 1.5, trades[1].Amount, "Amount should be correct")
 }
 
-// TestWsHandleKline asserts the candle is decoded, including that the candle volume is taken from
-// the protobuf `amount` field rather than `volume`.
+// TestWsHandleKline asserts the candle is decoded, including that the candle time is the window
+// start read as seconds and the volume is the base-asset `volume` field. MEXC sends windowStart/
+// windowEnd in whole seconds (measured live: windowStart=1788890580 => 2026-09-08 18:03:00Z), so
+// reading windowEnd as milliseconds stamped every candle in January 1970, and `amount` is the quote
+// turnover rather than the base volume.
 func TestWsHandleKline(t *testing.T) {
 	drainData(t)
 	raw := wsPushFrame(t, "spot@"+channelKlineV3+"@BTCUSDT@Min15", 1736410707571,
@@ -90,8 +93,9 @@ func TestWsHandleKline(t *testing.T) {
 	assert.Equal(t, 93158.47, c.Close, "Close should be correct")
 	assert.Equal(t, 93158.47, c.High, "High should be correct")
 	assert.Equal(t, 92800.0, c.Low, "Low should be correct")
-	assert.Equal(t, 3424811.05, c.Volume, "Volume should come from the amount field")
-	assert.Equal(t, time.UnixMilli(1736411400), c.Time, "Time should come from the window end")
+	assert.Equal(t, 36.83803224, c.Volume, "Volume should come from the base-asset volume field")
+	assert.Equal(t, time.Unix(1736410500, 0), c.Time, "Time should be the window start read as seconds")
+	assert.Equal(t, 2025, c.Time.UTC().Year(), "the candle must not land in 1970 from a millisecond misread")
 }
 
 // TestWsHandleKlineUnknownInterval asserts an interval the exchange has not documented is reported
@@ -125,6 +129,24 @@ func TestWsHandleLimitDepth(t *testing.T) {
 	assert.Equal(t, 0.21976424, book.Asks[0].Amount, "ask amount should be correct")
 	assert.Equal(t, 93179.98, book.Bids[0].Price, "bid price should be correct")
 	assert.Equal(t, 2.82651, book.Bids[0].Amount, "bid amount should be correct")
+}
+
+// TestWsHandleLimitDepthUsesExchangeTime asserts the orderbook snapshot is stamped with the frame's
+// exchange send time, not the local clock. The send time (1736411838730 => 2025-01-09) is years away
+// from any test run, so a book stamped with time.Now() would fail this.
+func TestWsHandleLimitDepthUsesExchangeTime(t *testing.T) {
+	drainData(t)
+	const sendTime = int64(1736411838730)
+	raw := wsPushFrame(t, "spot@"+channelLimitDepthV3+"@BTCUSDT@5", sendTime,
+		&mexc_proto_types.PublicLimitDepthsV3Api{
+			Asks: []*mexc_proto_types.PublicLimitDepthV3ApiItem{{Price: "93180.18", Quantity: "0.21976424"}},
+			Bids: []*mexc_proto_types.PublicLimitDepthV3ApiItem{{Price: "93179.98", Quantity: "2.82651000"}},
+		})
+	require.NoError(t, e.WsHandleData(t.Context(), nil, raw), "WsHandleData must not error")
+
+	book, err := orderbook.Get(e.Name, spotTradablePair, asset.Spot)
+	require.NoError(t, err, "the snapshot must be retrievable")
+	assert.Equal(t, time.UnixMilli(sendTime), book.LastUpdated, "the book should be stamped with the exchange send time, not time.Now()")
 }
 
 // TestWsHandleAggreDepth asserts the aggregated depth channel is accepted and reaches the book.

@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/thrasher-corp/gocryptotrader/currency"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/asset"
+	"github.com/thrasher-corp/gocryptotrader/exchanges/kline"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/orderbook"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/sharedtestvalues"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/subscription"
@@ -105,6 +106,101 @@ collect:
 	assert.Positive(t, tickersWithBBO, "websocket ticker with a non-zero best bid/offer should arrive")
 	assert.Positive(t, tickersWithLast, "websocket ticker should carry a last price")
 	assert.Positive(t, bookUpdates, "the existing orderbook path should keep publishing")
+}
+
+// TestLiveSpotKlineTimestamp subscribes to the live candle channel and asserts the decoded candle
+// carries a current timestamp. MEXC sends windowStart/windowEnd in seconds; the previous code read
+// windowEnd as milliseconds, which stamped every candle in January 1970. Only a live candle can show
+// the timestamp is both recent and close to the exchange clock. Public channel only, no credentials.
+func TestLiveSpotKlineTimestamp(t *testing.T) {
+	pairFormat, err := e.GetPairFormat(asset.Spot, false)
+	require.NoError(t, err, "GetPairFormat must not error")
+	pair := currency.NewBTCUSDT().Format(pairFormat)
+	origAvailable, err := e.GetAvailablePairs(asset.Spot)
+	require.NoError(t, err, "GetAvailablePairs must not error")
+	origEnabled, err := e.GetEnabledPairs(asset.Spot)
+	require.NoError(t, err, "GetEnabledPairs must not error")
+	t.Cleanup(func() {
+		require.NoError(t, e.CurrencyPairs.StorePairs(asset.Spot, origAvailable, false), "restoring the available pairs must not error")
+		require.NoError(t, e.CurrencyPairs.StorePairs(asset.Spot, origEnabled, true), "restoring the enabled pairs must not error")
+	})
+	require.NoError(t, e.CurrencyPairs.StorePairs(asset.Spot, currency.Pairs{pair}, false), "StorePairs must not error")
+	require.NoError(t, e.CurrencyPairs.StorePairs(asset.Spot, currency.Pairs{pair}, true), "StorePairs must not error")
+
+	testexch.SetupWs(t, e)
+	conn, err := e.Websocket.GetConnection(asset.Spot)
+	require.NoError(t, err, "GetConnection must not error")
+
+	sub := &subscription.Subscription{Enabled: true, Asset: asset.Spot, Channel: subscription.CandlesChannel, Interval: kline.OneMin}
+	subs, err := subscription.List{sub}.ExpandTemplates(e)
+	require.NoError(t, err, "ExpandTemplates must not error")
+	require.NoError(t, e.Subscribe(t.Context(), conn, subs), "Subscribe must not error")
+
+	deadline := time.After(90 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("no candle arrived within the window")
+		case p := <-e.Websocket.DataHandler.C:
+			item, ok := p.Data.(*kline.Item)
+			if !ok || len(item.Candles) == 0 {
+				continue
+			}
+			ts := item.Candles[0].Time
+			t.Logf("candle time: %s (now %s)", ts.UTC(), time.Now().UTC())
+			assert.Greaterf(t, ts.Year(), 2023, "candle time %s must be recent, not the 1970 millisecond misread", ts.UTC())
+			assert.WithinDurationf(t, time.Now(), ts, 10*time.Minute, "candle time %s should be close to now", ts.UTC())
+			return
+		}
+	}
+}
+
+// TestLiveSpotUnsubscribe proves an accepted unsubscribe removes the channel from the active set.
+// The exchange confirms an unsubscribe with code 0 echoing the channel (measured live); the previous
+// handler fed that back into AddSuccessfulSubscriptions, re-registering the channel it had cancelled.
+// Public channel only, no credentials.
+func TestLiveSpotUnsubscribe(t *testing.T) {
+	pairFormat, err := e.GetPairFormat(asset.Spot, false)
+	require.NoError(t, err, "GetPairFormat must not error")
+	pair := currency.NewBTCUSDT().Format(pairFormat)
+	origAvailable, err := e.GetAvailablePairs(asset.Spot)
+	require.NoError(t, err, "GetAvailablePairs must not error")
+	origEnabled, err := e.GetEnabledPairs(asset.Spot)
+	require.NoError(t, err, "GetEnabledPairs must not error")
+	t.Cleanup(func() {
+		require.NoError(t, e.CurrencyPairs.StorePairs(asset.Spot, origAvailable, false), "restoring the available pairs must not error")
+		require.NoError(t, e.CurrencyPairs.StorePairs(asset.Spot, origEnabled, true), "restoring the enabled pairs must not error")
+	})
+	require.NoError(t, e.CurrencyPairs.StorePairs(asset.Spot, currency.Pairs{pair}, false), "StorePairs must not error")
+	require.NoError(t, e.CurrencyPairs.StorePairs(asset.Spot, currency.Pairs{pair}, true), "StorePairs must not error")
+
+	testexch.SetupWs(t, e)
+	conn, err := e.Websocket.GetConnection(asset.Spot)
+	require.NoError(t, err, "GetConnection must not error")
+
+	// A distinct interval no other live test in this package subscribes to: the websocket instance is
+	// shared and set up once, so reusing a channel another test already subscribed would be deduped by
+	// the exchange and confuse the active-set check.
+	sub := &subscription.Subscription{Enabled: true, Asset: asset.Spot, Channel: subscription.CandlesChannel, Interval: kline.FiveMin}
+	subs, err := subscription.List{sub}.ExpandTemplates(e)
+	require.NoError(t, err, "ExpandTemplates must not error")
+	qualified := subs[0].QualifiedChannel
+
+	require.NoError(t, e.Subscribe(t.Context(), conn, subs), "Subscribe must not error")
+	require.True(t, hasActiveChannel(e, qualified), "the channel should be active after Subscribe")
+
+	require.NoError(t, e.Unsubscribe(t.Context(), conn, subs), "Unsubscribe must not error")
+	assert.Falsef(t, hasActiveChannel(e, qualified), "%s should be gone after Unsubscribe, not re-added", qualified)
+}
+
+// hasActiveChannel reports whether the qualified channel is in the websocket's active subscription set.
+func hasActiveChannel(e *Exchange, qualified string) bool {
+	for _, got := range e.Websocket.GetSubscriptions() {
+		if got.QualifiedChannel == qualified {
+			return true
+		}
+	}
+	return false
 }
 
 // TestLiveSpotPrivateSubscriptions exercises the authenticated websocket path against the live

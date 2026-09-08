@@ -1,6 +1,7 @@
 package mexc
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/thrasher-corp/gocryptotrader/exchanges/kline"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/order"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/sharedtestvalues"
+	"github.com/thrasher-corp/gocryptotrader/exchanges/ticker"
 )
 
 // Please supply your own keys here to do authenticated endpoint testing
@@ -180,6 +182,51 @@ func TestGetCandlestick(t *testing.T) {
 	result, err := e.GetCandlestick(t.Context(), spotTradablePair, "5m", startTime, endTime, 100)
 	require.NoError(t, err)
 	assert.NotNil(t, result)
+}
+
+// TestCandlesFromCandlestick asserts a candle is stamped with its open time, not its close time. The
+// exchange sends [openTime, o, h, l, c, volume, closeTime, quoteVolume]; stamping the candle with the
+// close time shifted every candle forward by one interval.
+func TestCandlesFromCandlestick(t *testing.T) {
+	t.Parallel()
+	var c CandlestickData
+	require.NoError(t, json.Unmarshal([]byte(`[1767056100000,"87231.15","87269.54","87231.12","87250.54","17.48934453",1767056400000,"1525897.53"]`), &c))
+	got := candlesFromCandlestick([]*CandlestickData{&c})
+	require.Len(t, got, 1, "one candle must be produced")
+	assert.Equal(t, time.UnixMilli(1767056100000), got[0].Time, "candle time should be the open time")
+	assert.NotEqual(t, time.UnixMilli(1767056400000), got[0].Time, "candle time must not be the close time")
+	assert.Equal(t, 87231.15, got[0].Open, "Open should be correct")
+	assert.Equal(t, 87250.54, got[0].Close, "Close should be correct")
+	assert.Equal(t, 87269.54, got[0].High, "High should be correct")
+	assert.Equal(t, 87231.12, got[0].Low, "Low should be correct")
+	assert.Equal(t, 17.48934453, got[0].Volume, "Volume should be the base volume")
+}
+
+// TestUpdateTickersResolvesConcatenatedSymbol asserts the 24h ticker symbol is resolved against the
+// known pairs rather than split naively. METALUSDT is present in the recorded 24h response and splits
+// to MET/ALUSDT under a naive parser; with the pair catalogued it must resolve to METAL/USDT.
+func TestUpdateTickersResolvesConcatenatedSymbol(t *testing.T) {
+	metal := currency.NewPair(currency.NewCode("METAL"), currency.USDT)
+	origAvailable, err := e.GetAvailablePairs(asset.Spot)
+	require.NoError(t, err, "GetAvailablePairs must not error")
+	origEnabled, err := e.GetEnabledPairs(asset.Spot)
+	require.NoError(t, err, "GetEnabledPairs must not error")
+	t.Cleanup(func() {
+		require.NoError(t, e.CurrencyPairs.StorePairs(asset.Spot, origAvailable, false), "restoring available pairs must not error")
+		require.NoError(t, e.CurrencyPairs.StorePairs(asset.Spot, origEnabled, true), "restoring enabled pairs must not error")
+	})
+	available := origAvailable
+	if !available.Contains(metal, true) {
+		available = append(available, metal)
+	}
+	require.NoError(t, e.CurrencyPairs.StorePairs(asset.Spot, available, false), "StorePairs must not error")
+
+	require.NoError(t, e.UpdateTickers(t.Context(), asset.Spot), "UpdateTickers must not error")
+
+	tick, err := ticker.GetTicker(e.Name, metal, asset.Spot)
+	require.NoError(t, err, "METALUSDT must resolve to METAL/USDT, not a mis-split")
+	assert.Equal(t, currency.NewCode("METAL"), tick.Pair.Base, "base should be METAL")
+	assert.Equal(t, currency.USDT, tick.Pair.Quote, "quote should be USDT")
 }
 
 func TestGetCurrentAveragePrice(t *testing.T) {
@@ -1263,7 +1310,12 @@ func TestUpdateOrderExecutionLimits(t *testing.T) {
 
 	symbolDetail := instrumentInfo.Symbols[0]
 	require.NotNil(t, symbolDetail, "instrument required to be found")
-	require.Equal(t, symbolDetail.QuoteAmountPrecision.Float64(), lms.PriceStepIncrementSize)
+	// The price tick is 10^-quotePrecision, not the quoteAmountPrecision value: quoteAmountPrecision
+	// is the minimum quote order amount (min notional). The previous mapping put that amount into the
+	// price step, quantizing prices to whole quote units.
+	require.Equal(t, math.Pow(10, -symbolDetail.QuotePrecision), lms.PriceStepIncrementSize, "price tick should be 10^-quotePrecision")
+	assert.Equal(t, symbolDetail.QuoteAmountPrecision.Float64(), lms.MinimumQuoteAmount, "quoteAmountPrecision should map to the minimum quote amount")
+	assert.Equal(t, math.Pow(10, -symbolDetail.BaseAssetPrecision), lms.AmountStepIncrementSize, "base amount step should be 10^-baseAssetPrecision")
 	assert.Equal(t, symbolDetail.BaseSizePrecision.Float64(), lms.MinimumBaseAmount)
 	assert.Equal(t, symbolDetail.MaxQuoteAmount.Float64(), lms.MaximumQuoteAmount)
 }

@@ -41,6 +41,21 @@ func TestChannelName(t *testing.T) {
 		"an unsupported asset should fall through to the raw channel name")
 }
 
+// TestOrderbookSnapshotClaim asserts the snapshot-loaded bookkeeping is atomic and that a reconnect
+// reset makes a symbol reload its snapshot. This is the state that the previous unlocked map read
+// raced on and that a reconnect never cleared, leaving increments applied to a stale book.
+func TestOrderbookSnapshotClaim(t *testing.T) {
+	const symbol = "PROBEUSDT"
+	resetOrderbookSnapshots()
+	t.Cleanup(resetOrderbookSnapshots)
+	assert.True(t, claimOrderbookSnapshot(symbol), "the first claim should win and load the snapshot")
+	assert.False(t, claimOrderbookSnapshot(symbol), "a second claim for the same symbol should be denied")
+	releaseOrderbookSnapshot(symbol)
+	assert.True(t, claimOrderbookSnapshot(symbol), "after a failed load released the mark, the claim should win again")
+	resetOrderbookSnapshots()
+	assert.True(t, claimOrderbookSnapshot(symbol), "after a reconnect reset the snapshot should reload")
+}
+
 // wsTestSymbol is the only pair the mock exchange enables, so every test frame carries it.
 const wsTestSymbol = "BTCUSDT"
 

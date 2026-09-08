@@ -52,17 +52,54 @@ const (
 	wsPongMessage = "PONG"
 )
 
-// orderbookSnapshotLoadedPairs and syncOrderbookPairsLock holds list of symbols and if these instruments snapshot orderbook detail is loaded, and corresponding lock
+// orderbookSnapshotLoadedPairs records, per symbol, whether a full orderbook snapshot has already
+// been loaded for the current websocket connection; syncOrderbookPairsLock guards every access to it.
+// The map must be reset on each (re)connect: the exchange restarts the depth stream from a fresh
+// snapshot after a reconnect, so a symbol left marked "loaded" would skip the new snapshot and apply
+// increments onto a stale book.
 var (
 	orderbookSnapshotLoadedPairs = map[string]bool{}
 	syncOrderbookPairsLock       sync.Mutex
 )
+
+// claimOrderbookSnapshot reports whether the caller should load the snapshot for symbol, atomically
+// marking it loaded so a concurrent frame for the same symbol does not load it twice. All access to
+// the shared map goes through the lock, so the depth handlers are free of the data race the earlier
+// unlocked read introduced (concurrent map read/write is a fatal error under the race detector).
+func claimOrderbookSnapshot(symbol string) bool {
+	syncOrderbookPairsLock.Lock()
+	defer syncOrderbookPairsLock.Unlock()
+	if orderbookSnapshotLoadedPairs[symbol] {
+		return false
+	}
+	orderbookSnapshotLoadedPairs[symbol] = true
+	return true
+}
+
+// releaseOrderbookSnapshot clears the loaded mark for symbol so the snapshot is retried, used when the
+// load that claimed it failed.
+func releaseOrderbookSnapshot(symbol string) {
+	syncOrderbookPairsLock.Lock()
+	defer syncOrderbookPairsLock.Unlock()
+	delete(orderbookSnapshotLoadedPairs, symbol)
+}
+
+// resetOrderbookSnapshots forgets every loaded mark; called on connect so a reconnect reloads snapshots.
+func resetOrderbookSnapshots() {
+	syncOrderbookPairsLock.Lock()
+	defer syncOrderbookPairsLock.Unlock()
+	clear(orderbookSnapshotLoadedPairs)
+}
 
 // WsConnect initiates a websocket connection
 func (e *Exchange) WsConnect(ctx context.Context, conn websocket.Connection) error {
 	if !e.Websocket.IsEnabled() || !e.IsEnabled() {
 		return websocket.ErrWebsocketNotEnabled
 	}
+	// A reconnect restarts the depth stream from a fresh snapshot; drop the per-connection loaded
+	// marks so every subscribed symbol reloads its snapshot instead of applying increments onto a
+	// book kept from the previous connection.
+	resetOrderbookSnapshots()
 	if e.Websocket.CanUseAuthenticatedEndpoints() {
 		listenKey, err := e.GenerateListenKey(ctx)
 		if err != nil {
@@ -211,7 +248,7 @@ func subscriptionAccepted(method, qualifiedChannel, msg string) bool {
 }
 
 func (e *Exchange) handleSubscription(ctx context.Context, conn websocket.Connection, method string, subs subscription.List) error {
-	var successfulSubscriptions, failedSubscriptions subscription.List
+	var confirmed, rejected subscription.List
 	for s := range subs {
 		id := e.MessageSequence()
 		data, err := conn.SendMessageReturnResponse(ctx, request.UnAuth, id, &WsSubscriptionPayload{
@@ -226,15 +263,23 @@ func (e *Exchange) handleSubscription(ctx context.Context, conn websocket.Connec
 		if err := json.Unmarshal(data, &resp); err != nil {
 			return err
 		} else if resp.Code != 0 || !subscriptionAccepted(method, subs[s].QualifiedChannel, resp.Message) {
-			failedSubscriptions = append(failedSubscriptions, subs[s])
+			rejected = append(rejected, subs[s])
 		} else {
-			successfulSubscriptions = append(successfulSubscriptions, subs[s])
+			confirmed = append(confirmed, subs[s])
 		}
 	}
-	if err := e.Websocket.RemoveSubscriptions(conn, failedSubscriptions...); err != nil {
+	if method == "UNSUBSCRIPTION" {
+		// A confirmed unsubscription removes the channel from the active set; a rejected one is left
+		// registered because it is still live. The previous code added every confirmed channel via
+		// AddSuccessfulSubscriptions, so an accepted unsubscribe (MEXC replies code 0 echoing the
+		// channel — measured live) re-registered the channel it had just cancelled.
+		return e.Websocket.RemoveSubscriptions(conn, confirmed...)
+	}
+	// SUBSCRIPTION: drop the rejected pending subscriptions and register the confirmed ones.
+	if err := e.Websocket.RemoveSubscriptions(conn, rejected...); err != nil {
 		return err
 	}
-	return e.Websocket.AddSuccessfulSubscriptions(conn, successfulSubscriptions...)
+	return e.Websocket.AddSuccessfulSubscriptions(conn, confirmed...)
 }
 
 // wsUpdateSpotTicker merges a partial spot ticker update into the cached ticker and publishes it.
@@ -445,27 +490,25 @@ func (e *Exchange) WsHandleData(ctx context.Context, conn websocket.Connection, 
 			}
 		}
 
-		if !orderbookSnapshotLoadedPairs[result.GetSymbol()] {
+		if claimOrderbookSnapshot(result.GetSymbol()) {
 			if err := e.Websocket.Orderbook.LoadSnapshot(&orderbook.Book{
 				Exchange:    e.Name,
 				Asset:       asset.Spot,
 				Asks:        asks,
 				Bids:        bids,
 				Pair:        cp.Format(format),
-				LastUpdated: time.Now(),
+				LastUpdated: wsSendTime(result),
 			}); err != nil {
+				releaseOrderbookSnapshot(result.GetSymbol())
 				return err
 			}
-			syncOrderbookPairsLock.Lock()
-			orderbookSnapshotLoadedPairs[result.GetSymbol()] = true
-			syncOrderbookPairsLock.Unlock()
 		}
 		return e.Websocket.Orderbook.Update(&orderbook.Update{
 			Asset:      asset.Spot,
 			Asks:       asks,
 			Bids:       bids,
 			Pair:       cp.Format(format),
-			UpdateTime: time.Now(),
+			UpdateTime: wsSendTime(result),
 		})
 	case channelAggreDealsV3:
 		cp, err := e.MatchSymbolWithAvailablePairs(result.GetSymbol(), asset.Spot, false)
@@ -516,20 +559,21 @@ func (e *Exchange) WsHandleData(ctx context.Context, conn websocket.Connection, 
 			return err
 		}
 		klineData := kline.Candle{}
-		klineData.Time = time.UnixMilli(body.WindowEnd)
-		if klineData.Volume, err = strconv.ParseFloat(body.Amount, 64); err != nil {
+		// MEXC sends windowStart/windowEnd in whole seconds (measured live on BTCUSDT Min1:
+		// windowStart=1788890580 => 2026-09-08 18:03:00Z). Reading windowEnd as milliseconds put
+		// every candle in January 1970. The candle is stamped with its open (windowStart), matching
+		// this repository's kline convention that Candle.Time is the interval start.
+		klineData.Time = time.Unix(body.WindowStart, 0)
+		// `volume` is the base-asset volume; `amount` is the quote turnover (measured live for one
+		// BTCUSDT candle: volume=0.11909876 base vs amount=9356.31 quote). Candle.Volume is base terms.
+		if klineData.Volume, err = strconv.ParseFloat(body.Volume, 64); err != nil {
 			return err
 		}
-		// klineData. = time.UnixMilli(body.WindowStart)
 		klineData.Low, err = strconv.ParseFloat(body.LowestPrice, 64)
 		if err != nil {
 			return err
 		}
 		klineData.High, err = strconv.ParseFloat(body.HighestPrice, 64)
-		if err != nil {
-			return err
-		}
-		klineData.Low, err = strconv.ParseFloat(body.LowestPrice, 64)
 		if err != nil {
 			return err
 		}
@@ -580,26 +624,24 @@ func (e *Exchange) WsHandleData(ctx context.Context, conn websocket.Connection, 
 					return err
 				}
 			}
-			if ok := orderbookSnapshotLoadedPairs[result.GetSymbol()]; !ok {
+			if claimOrderbookSnapshot(result.GetSymbol()) {
 				if err := e.Websocket.Orderbook.LoadSnapshot(&orderbook.Book{
 					Exchange:    e.Name,
 					Pair:        cp,
 					Asks:        asks,
 					Bids:        bids,
 					Asset:       asset.Spot,
-					LastUpdated: time.Now(),
+					LastUpdated: wsSendTime(result),
 				}); err != nil {
+					releaseOrderbookSnapshot(result.GetSymbol())
 					return err
 				}
-				syncOrderbookPairsLock.Lock()
-				orderbookSnapshotLoadedPairs[result.GetSymbol()] = true
-				syncOrderbookPairsLock.Unlock()
 			}
 			if err := e.Websocket.Orderbook.Update(&orderbook.Update{
 				Pair:       cp,
 				Asks:       asks,
 				Bids:       bids,
-				UpdateTime: time.Now(),
+				UpdateTime: wsSendTime(result),
 				Asset:      asset.Spot,
 			}); err != nil {
 				return err
@@ -642,7 +684,7 @@ func (e *Exchange) WsHandleData(ctx context.Context, conn websocket.Connection, 
 			Bids:        bids,
 			Asks:        asks,
 			Pair:        cp,
-			LastUpdated: time.Now(),
+			LastUpdated: wsSendTime(result),
 		})
 	case channelBookTickerBatch:
 		cp, err := e.MatchSymbolWithAvailablePairs(result.GetSymbol(), asset.Spot, true)

@@ -3,6 +3,7 @@ package mexc
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -255,9 +256,16 @@ func (e *Exchange) UpdateTickers(ctx context.Context, assetType asset.Item) erro
 			return err
 		}
 		for t := range tickers {
-			pair, err := currency.NewPairFromString(tickers[t].Symbol)
+			// Resolve the concatenated symbol against the known pairs. A naive split guesses the
+			// base/quote boundary and gets it wrong for any symbol whose split is ambiguous
+			// (measured against the live catalogue: 1376 of 2067 spot symbols, e.g. METALUSDT was
+			// read as MET/ALUSDT). MatchSymbolWithAvailablePairs looks the symbol up instead. The
+			// 24h endpoint returns every listed symbol, so a symbol we do not track (delisted between
+			// a catalogue refresh and this poll) is skipped rather than failing the whole update or,
+			// as the naive split did, inventing a mis-split pair.
+			pair, err := e.MatchSymbolWithAvailablePairs(tickers[t].Symbol, assetType, false)
 			if err != nil {
-				return err
+				continue
 			}
 			if err := ticker.ProcessTicker(&ticker.Price{
 				Pair:         pair,
@@ -915,6 +923,25 @@ func (e *Exchange) GetFeeByType(ctx context.Context, feeBuilder *exchange.FeeBui
 	return 0, nil
 }
 
+// candlesFromCandlestick maps the exchange's candlestick rows to kline candles. The candle is stamped
+// with its open time (the interval start), which is this repository's kline convention: the exchange
+// also reports a close time, and stamping the candle with that shifted every candle forward by one
+// interval. It is the single mapping shared by GetHistoricCandles and GetHistoricCandlesExtended.
+func candlesFromCandlestick(result []*CandlestickData) []kline.Candle {
+	candles := make([]kline.Candle, len(result))
+	for c := range result {
+		candles[c] = kline.Candle{
+			Open:   result[c].OpenPrice.Float64(),
+			High:   result[c].HighPrice.Float64(),
+			Low:    result[c].LowPrice.Float64(),
+			Close:  result[c].ClosePrice.Float64(),
+			Volume: result[c].Volume.Float64(),
+			Time:   result[c].OpenTime.Time(),
+		}
+	}
+	return candles
+}
+
 // GetHistoricCandles returns candles between a time period for a set time interval
 func (e *Exchange) GetHistoricCandles(ctx context.Context, pair currency.Pair, a asset.Item, interval kline.Interval, start, end time.Time) (*kline.Item, error) {
 	intervalString, err := intervalToString(interval)
@@ -935,18 +962,7 @@ func (e *Exchange) GetHistoricCandles(ctx context.Context, pair currency.Pair, a
 		if err != nil {
 			return nil, err
 		}
-		timeSeries := make([]kline.Candle, len(result))
-		for c := range result {
-			timeSeries[c] = kline.Candle{
-				Close:  result[c].ClosePrice.Float64(),
-				Open:   result[c].OpenPrice.Float64(),
-				High:   result[c].HighPrice.Float64(),
-				Low:    result[c].LowPrice.Float64(),
-				Time:   result[c].CloseTime.Time(),
-				Volume: result[c].Volume.Float64(),
-			}
-		}
-		return req.ProcessResponse(timeSeries)
+		return req.ProcessResponse(candlesFromCandlestick(result))
 	default:
 		return nil, fmt.Errorf("%w asset type: %v", asset.ErrNotSupported, a)
 	}
@@ -981,16 +997,7 @@ func (e *Exchange) GetHistoricCandlesExtended(ctx context.Context, pair currency
 			if err != nil {
 				return nil, err
 			}
-			for c := range result {
-				timeSeries = append(timeSeries, kline.Candle{
-					Close:  result[c].ClosePrice.Float64(),
-					Open:   result[c].OpenPrice.Float64(),
-					High:   result[c].HighPrice.Float64(),
-					Low:    result[c].LowPrice.Float64(),
-					Volume: result[c].Volume.Float64(),
-					Time:   result[c].CloseTime.Time(),
-				})
-			}
+			timeSeries = append(timeSeries, candlesFromCandlestick(result)...)
 		}
 		return req.ProcessResponse(timeSeries)
 	default:
@@ -1026,12 +1033,20 @@ func (e *Exchange) UpdateOrderExecutionLimits(ctx context.Context, assetType ass
 			if err != nil {
 				return err
 			}
+			// quoteAmountPrecision is the minimum quote order amount (measured live for METALUSDT:
+			// "1" USDT), not a price step; the price tick is 10^-quotePrecision (quotePrecision=5 =>
+			// 0.00001) and the base amount step is 10^-baseAssetPrecision. The previous mapping put
+			// the min-notional value ("1") into both the price and quote step, quantizing prices to
+			// whole units.
 			l[a] = limits.MinMaxLevel{
-				Key:                    key.NewExchangeAssetPair(e.Name, assetType, pair.Format(pairFormat)),
-				PriceStepIncrementSize: result.Symbols[a].QuoteAmountPrecision.Float64(),
-				QuoteStepIncrementSize: result.Symbols[a].QuoteAmountPrecision.Float64(),
-				MaximumQuoteAmount:     result.Symbols[a].MaxQuoteAmount.Float64(),
-				MinimumBaseAmount:      result.Symbols[a].BaseSizePrecision.Float64(),
+				Key:                     key.NewExchangeAssetPair(e.Name, assetType, pair.Format(pairFormat)),
+				PriceStepIncrementSize:  math.Pow(10, -result.Symbols[a].QuotePrecision),
+				AmountStepIncrementSize: math.Pow(10, -result.Symbols[a].BaseAssetPrecision),
+				QuoteStepIncrementSize:  math.Pow(10, -result.Symbols[a].QuoteAssetPrecision),
+				MinimumQuoteAmount:      result.Symbols[a].QuoteAmountPrecision.Float64(),
+				MinNotional:             result.Symbols[a].QuoteAmountPrecision.Float64(),
+				MaximumQuoteAmount:      result.Symbols[a].MaxQuoteAmount.Float64(),
+				MinimumBaseAmount:       result.Symbols[a].BaseSizePrecision.Float64(),
 			}
 		}
 		if err := limits.Load(l); err != nil {
