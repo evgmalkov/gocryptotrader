@@ -199,3 +199,37 @@ func TestStringToOrderTypeAndTimeInForceIOC(t *testing.T) {
 	assert.Equal(t, order.ImmediateOrCancel, tif, "time-in-force must be IOC")
 	assert.Equal(t, order.Market, oType, "IOC maps to a market order type on MEXC")
 }
+
+// TestActiveOrdersLastUpdatedFallback covers the LastUpdated timestamp for open orders. MEXC returns
+// updateTime:null on an open (still-working) order; without a fallback LastUpdated was stamped at the
+// zero time (1970). The fallback uses the creation time (time) when updateTime is empty, and keeps
+// updateTime when it is present. CERT finding ADR-272 §8.
+func TestActiveOrdersLastUpdatedFallback(t *testing.T) {
+	t.Parallel()
+	const (
+		created = 1704067200000 // 2024-01-01T00:00:00Z
+		updated = 1704067260000 // 2024-01-01T00:01:00Z
+	)
+	ex := newPrivateTestExchange(t, jsonHandler(t, map[string]string{
+		// First order is open: updateTime is null. Second order carries a real updateTime.
+		"openOrders": `[{"symbol":"BTCUSDT","orderId":"111","price":"50000","origQty":"0.5",` +
+			`"executedQty":"0","cummulativeQuoteQty":"0","type":"LIMIT","side":"BUY",` +
+			`"status":"NEW","time":1704067200000,"updateTime":null},` +
+			`{"symbol":"BTCUSDT","orderId":"222","price":"50000","origQty":"0.5",` +
+			`"executedQty":"0.2","cummulativeQuoteQty":"10000","type":"LIMIT","side":"BUY",` +
+			`"status":"PARTIALLY_FILLED","time":1704067200000,"updateTime":1704067260000}]`,
+	}))
+	orders, err := ex.GetActiveOrders(t.Context(), &order.MultiOrderRequest{
+		AssetType: asset.Spot,
+		Pairs:     currency.Pairs{spotTradablePair},
+	})
+	require.NoError(t, err, "GetActiveOrders must not error")
+	require.Len(t, orders, 2, "both open orders must be relayed")
+
+	// Fallback case: updateTime was null, so LastUpdated must fall back to the creation time.
+	assert.False(t, orders[0].LastUpdated.IsZero(), "LastUpdated must not be the zero time when updateTime is null")
+	assert.Equal(t, int64(created), orders[0].LastUpdated.UnixMilli(), "LastUpdated must fall back to time (creation) when updateTime is empty")
+
+	// Positive case: a real updateTime must still be used verbatim (existing behaviour preserved).
+	assert.Equal(t, int64(updated), orders[1].LastUpdated.UnixMilli(), "LastUpdated must come from updateTime when it is present")
+}

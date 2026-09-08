@@ -817,6 +817,12 @@ func (e *Exchange) orderDetailFromRESTOrder(o *OrderDetail) (order.Detail, error
 			return order.Detail{}, err
 		}
 	}
+	// MEXC returns updateTime:null on an open (still-working) order, which decodes to the zero time.
+	// Fall back to the creation time so LastUpdated is never stamped at 1970. CERT finding ADR-272 §8.
+	lastUpdated := o.UpdateTime.Time()
+	if lastUpdated.IsZero() {
+		lastUpdated = o.Time.Time()
+	}
 	return order.Detail{
 		Price:                o.Price.Float64(),
 		Amount:               o.OrigQty.Float64(),
@@ -832,7 +838,7 @@ func (e *Exchange) orderDetailFromRESTOrder(o *OrderDetail) (order.Detail, error
 		Status:               oStatus,
 		AssetType:            asset.Spot,
 		Date:                 o.Time.Time(),
-		LastUpdated:          o.UpdateTime.Time(),
+		LastUpdated:          lastUpdated,
 		Pair:                 pair,
 		TimeInForce:          tif,
 	}, nil
