@@ -373,8 +373,13 @@ func (e *Exchange) UpdateAccountBalances(ctx context.Context, assetType asset.It
 	}
 	for b := range accountInfo.Balances {
 		ccy := currency.NewCode(accountInfo.Balances[b].Asset)
+		// MEXC reports free (available) and locked (frozen) per asset. The account layer keeps the
+		// three views independently: Total = free + locked, Hold = locked, Free = free. Free was left
+		// unset, so an asset with free=10/locked=3 reported Total=13/Hold=3/Free=0 - a consumer
+		// reading available balance saw nothing.
 		subAccount.Balances[ccy] = accounts.Balance{
 			Currency: ccy,
+			Free:     accountInfo.Balances[b].Free.Float64(),
 			Hold:     accountInfo.Balances[b].Locked.Float64(),
 			Total:    accountInfo.Balances[b].Free.Float64() + accountInfo.Balances[b].Locked.Float64(),
 		}
@@ -447,7 +452,7 @@ func (e *Exchange) GetAccountFundingHistory(ctx context.Context) ([]exchange.Fun
 			ExchangeName:    e.Name,
 			Status:          accountStatusToString(result[a].Status),
 			TransferID:      result[a].TransactionID,
-			Timestamp:       result[a].ConfirmTimes.Time(),
+			Timestamp:       result[a].InsertTime.Time(),
 			Currency:        result[a].Coin.String(),
 			Amount:          result[a].Amount.Float64(),
 			CryptoToAddress: result[a].Address,
@@ -645,7 +650,18 @@ func (e *Exchange) CancelOrder(ctx context.Context, ord *order.Cancel) error {
 	if ord.AssetType != asset.Spot {
 		return fmt.Errorf("%w: %v", asset.ErrNotSupported, ord.AssetType)
 	}
-	_, err := e.CancelTradeOrder(ctx, ord.Pair, ord.OrderID, ord.ClientOrderID, "")
+	// MEXC expects the symbol without a delimiter (BTCUSDT). Passing ord.Pair through unformatted
+	// sent BTC-USDT when the pair carried a delimiter, which the exchange rejects. An empty pair is
+	// left to CancelTradeOrder to reject, preserving its ErrSymbolStringEmpty contract.
+	pair := ord.Pair
+	if !pair.IsEmpty() {
+		var err error
+		pair, err = e.FormatExchangeCurrency(pair, ord.AssetType)
+		if err != nil {
+			return err
+		}
+	}
+	_, err := e.CancelTradeOrder(ctx, pair, ord.OrderID, ord.ClientOrderID, "")
 	return err
 }
 
@@ -656,7 +672,10 @@ func (e *Exchange) CancelBatchOrders(context.Context, []order.Cancel) (*order.Ca
 
 // CancelAllOrders cancels all orders associated with a currency pair
 func (e *Exchange) CancelAllOrders(ctx context.Context, orderCancellation *order.Cancel) (order.CancelAllResponse, error) {
-	if err := orderCancellation.Validate(orderCancellation.StandardCancel()); err != nil {
+	// This is a symbol-wide cancel: it cancels every open order for the pair and takes no order id,
+	// so StandardCancel() (which requires an OrderID) must not gate it - it rejected a valid
+	// symbol-wide request with order.ErrOrderIDNotSet.
+	if err := orderCancellation.Validate(); err != nil {
 		return order.CancelAllResponse{}, err
 	}
 	resp := order.CancelAllResponse{
@@ -773,6 +792,52 @@ func (e *Exchange) WithdrawFiatFundsToInternationalBank(context.Context, *withdr
 	return nil, common.ErrFunctionNotSupported
 }
 
+// orderDetailFromRESTOrder maps a spot REST order record to a domain order.Detail. It is the single
+// mapping shared by GetActiveOrders and GetOrderHistory: both previously omitted the pair and the
+// order's real timestamps, and GetOrderHistory parsed the type with the generic order.StringToOrderType,
+// which does not know MEXC's IMMEDIATE_OR_CANCEL/FILL_OR_KILL/LIMIT_MAKER types and failed the whole
+// query, returning nothing.
+func (e *Exchange) orderDetailFromRESTOrder(o *OrderDetail) (order.Detail, error) {
+	pair, err := e.MatchSymbolWithAvailablePairs(o.Symbol, asset.Spot, false)
+	if err != nil {
+		return order.Detail{}, err
+	}
+	oType, tif, err := e.StringToOrderTypeAndTimeInForce(o.Type)
+	if err != nil {
+		return order.Detail{}, err
+	}
+	oSide, err := order.StringToOrderSide(o.Side)
+	if err != nil {
+		return order.Detail{}, err
+	}
+	var oStatus order.Status
+	if o.Status != "" {
+		oStatus, err = orderStatusFromString(o.Status)
+		if err != nil {
+			return order.Detail{}, err
+		}
+	}
+	return order.Detail{
+		Price:                o.Price.Float64(),
+		Amount:               o.OrigQty.Float64(),
+		AverageExecutedPrice: o.Price.Float64(),
+		QuoteAmount:          o.CummulativeQuoteQty.Float64(),
+		ExecutedAmount:       o.ExecutedQty.Float64(),
+		RemainingAmount:      o.OrigQty.Float64() - o.ExecutedQty.Float64(),
+		Exchange:             e.Name,
+		OrderID:              o.OrderID,
+		ClientOrderID:        o.ClientOrderID,
+		Type:                 oType,
+		Side:                 oSide,
+		Status:               oStatus,
+		AssetType:            asset.Spot,
+		Date:                 o.Time.Time(),
+		LastUpdated:          o.UpdateTime.Time(),
+		Pair:                 pair,
+		TimeInForce:          tif,
+	}, nil
+}
+
 // GetActiveOrders retrieves any orders that are active/open
 func (e *Exchange) GetActiveOrders(ctx context.Context, getOrdersRequest *order.MultiOrderRequest) (order.FilteredOrders, error) {
 	pairFormat, err := e.GetPairFormat(getOrdersRequest.AssetType, true)
@@ -791,43 +856,11 @@ func (e *Exchange) GetActiveOrders(ctx context.Context, getOrdersRequest *order.
 				return nil, err
 			}
 			for r := range result {
-				var oStatus order.Status
-				switch result[r].Status {
-				case "NEW":
-					oStatus = order.New
-				case "FILLED":
-					oStatus = order.Filled
-				case "PARTIALLY_FILLED":
-					oStatus = order.PartiallyFilled
-				case "CANCELED":
-					oStatus = order.Cancelled
-				case "PARTIALLY_CANCELED":
-					oStatus = order.PartiallyCancelled
-				}
-				oSide, err := order.StringToOrderSide(result[r].Side)
+				detail, err := e.orderDetailFromRESTOrder(result[r])
 				if err != nil {
 					return nil, err
 				}
-				oType, err := order.StringToOrderType(result[r].Type)
-				if err != nil {
-					return nil, err
-				}
-				details = append(details, order.Detail{
-					Price:                result[r].Price.Float64(),
-					Amount:               result[r].OrigQty.Float64(),
-					AverageExecutedPrice: result[r].Price.Float64(),
-					QuoteAmount:          result[r].CummulativeQuoteQty.Float64(),
-					ExecutedAmount:       result[r].ExecutedQty.Float64(),
-					RemainingAmount:      result[r].OrigQty.Float64() - result[r].ExecutedQty.Float64(),
-					Exchange:             e.Name,
-					OrderID:              result[r].OrderID,
-					ClientOrderID:        result[r].ClientOrderID,
-					Type:                 oType,
-					Side:                 oSide,
-					Status:               oStatus,
-					AssetType:            asset.Spot,
-					LastUpdated:          result[r].TransactTime.Time(),
-				})
+				details = append(details, detail)
 			}
 		}
 		return details, nil
@@ -855,43 +888,11 @@ func (e *Exchange) GetOrderHistory(ctx context.Context, getOrdersRequest *order.
 		}
 		orderDetails := make(order.FilteredOrders, len(result))
 		for r := range result {
-			var oStatus order.Status
-			switch result[r].Status {
-			case "NEW":
-				oStatus = order.New
-			case "FILLED":
-				oStatus = order.Filled
-			case "PARTIALLY_FILLED":
-				oStatus = order.PartiallyFilled
-			case "CANCELED":
-				oStatus = order.Cancelled
-			case "PARTIALLY_CANCELED":
-				oStatus = order.PartiallyCancelled
-			}
-			oSide, err := order.StringToOrderSide(result[r].Side)
+			detail, err := e.orderDetailFromRESTOrder(result[r])
 			if err != nil {
 				return nil, err
 			}
-			oType, err := order.StringToOrderType(result[r].Type)
-			if err != nil {
-				return nil, err
-			}
-			orderDetails[r] = order.Detail{
-				Price:                result[r].Price.Float64(),
-				Amount:               result[r].OrigQty.Float64(),
-				AverageExecutedPrice: result[r].Price.Float64(),
-				QuoteAmount:          result[r].CummulativeQuoteQty.Float64(),
-				ExecutedAmount:       result[r].ExecutedQty.Float64(),
-				RemainingAmount:      result[r].OrigQty.Float64() - result[r].ExecutedQty.Float64(),
-				Exchange:             e.Name,
-				OrderID:              result[r].OrderID,
-				ClientOrderID:        result[r].ClientOrderID,
-				Type:                 oType,
-				Side:                 oSide,
-				Status:               oStatus,
-				AssetType:            asset.Spot,
-				LastUpdated:          result[r].TransactTime.Time(),
-			}
+			orderDetails[r] = detail
 		}
 		return orderDetails, nil
 	default:
@@ -901,6 +902,10 @@ func (e *Exchange) GetOrderHistory(ctx context.Context, getOrdersRequest *order.
 
 // GetFeeByType returns an estimate of fee based on the type of transaction
 func (e *Exchange) GetFeeByType(ctx context.Context, feeBuilder *exchange.FeeBuilder) (float64, error) {
+	// GetFeeByType returns the absolute fee amount for a live trade, not the fee rate. The amount is
+	// rate * price * quantity; returning the bare rate reported e.g. 0.002 as if it were the fee.
+	// The OfflineTradeFee branch is a fixed worst-case estimate used when the live rate cannot be
+	// fetched (asserted by TestGetFeeByTypeOffline) and is left as-is.
 	switch feeBuilder.FeeType {
 	case exchange.OfflineTradeFee:
 		if feeBuilder.IsMaker {
@@ -912,10 +917,11 @@ func (e *Exchange) GetFeeByType(ctx context.Context, feeBuilder *exchange.FeeBui
 		if err != nil {
 			return 0, err
 		}
+		rate := result.Data.TakerCommission
 		if feeBuilder.IsMaker {
-			return result.Data.MakerCommission, nil
+			rate = result.Data.MakerCommission
 		}
-		return result.Data.TakerCommission, nil
+		return rate * feeBuilder.PurchasePrice * feeBuilder.Amount, nil
 	case exchange.CryptocurrencyWithdrawalFee:
 	case exchange.CryptocurrencyDepositFee:
 	case exchange.InternationalBankDepositFee:

@@ -266,20 +266,23 @@ func TestWsHandlePrivateAccount(t *testing.T) {
 	assert.Equal(t, asset.Spot, change.AssetType, "AssetType should be correct")
 }
 
-// TestWsHandlePrivateDeals asserts a private trade frame is routed and decoded.
+// TestWsHandlePrivateDeals asserts a private fill is decoded with the base quantity as Amount and the
+// trade id as TID. MEXC's private deals frame carries both a base quantity and a quote amount, and
+// both a tradeId and an orderId: the fill previously used the quote amount as size and the order id
+// as TID (which collides across a partially filled order's fills). Contract: group T defect #6.
 func TestWsHandlePrivateDeals(t *testing.T) {
 	drainData(t)
 	raw := wsPushFrame(t, "spot@"+channelPrivateDealsV3, 1736409765052,
 		&mexc_proto_types.PrivateDealsV3Api{
-			Price: "93220.00", Amount: "0.044", OrderId: "o-1", TradeType: 1, Time: 1736409765051,
+			Price: "93220.00", Quantity: "0.044", Amount: "4101.68", TradeId: "t-1", OrderId: "o-1", TradeType: 1, Time: 1736409765051,
 		})
 	require.NoError(t, e.WsHandleData(t.Context(), nil, raw), "WsHandleData must not error")
 
 	trades := requireOneOf[[]trade.Data](t)
 	require.Len(t, trades, 1, "one trade must be relayed")
-	assert.Equal(t, "o-1", trades[0].TID, "TID should be the order id")
+	assert.Equal(t, "t-1", trades[0].TID, "TID must be the trade id, not the order id")
 	assert.Equal(t, 93220.00, trades[0].Price, "Price should be correct")
-	assert.Equal(t, 0.044, trades[0].Amount, "Amount should be correct")
+	assert.Equal(t, 0.044, trades[0].Amount, "Amount must be the base quantity, not the quote amount")
 	assert.Equal(t, order.Buy, trades[0].Side, "tradeType 1 should map to Buy")
 	assert.Equal(t, int64(1736409765051), trades[0].Timestamp.UnixMilli(), "Timestamp should come from the deal time")
 }

@@ -370,7 +370,11 @@ type FundDepositInfo struct {
 	UnlockConfirm string        `json:"unlockConfirm"`
 	Memo          string        `json:"memo"`
 	InsertTime    types.Time    `json:"insertTime"`
-	ConfirmTimes  types.Time    `json:"confirmTimes"`
+	// ConfirmTimes is a network-confirmation counter (e.g. "241" or "1/1"), NOT a timestamp. It was
+	// previously decoded as types.Time, which made a plain count such as "241" fail with
+	// "invalid timestamp" and, when it did decode, stamped the record at 1970. The deposit's real
+	// time is insertTime.
+	ConfirmTimes string `json:"confirmTimes"`
 }
 
 // WithdrawalInfo represents an asset withdrawal detailed information

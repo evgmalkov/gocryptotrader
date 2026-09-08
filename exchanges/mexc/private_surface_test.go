@@ -1,0 +1,201 @@
+package mexc
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/thrasher-corp/gocryptotrader/currency"
+	"github.com/thrasher-corp/gocryptotrader/exchange/accounts"
+	exchange "github.com/thrasher-corp/gocryptotrader/exchanges"
+	"github.com/thrasher-corp/gocryptotrader/exchanges/asset"
+	"github.com/thrasher-corp/gocryptotrader/exchanges/order"
+	testexch "github.com/thrasher-corp/gocryptotrader/internal/testing/exchange"
+)
+
+// newPrivateTestExchange builds an isolated Exchange whose spot REST endpoint points at a local
+// httptest server returning recorded (fixture) MEXC responses. It never reaches a live private
+// endpoint (proving the private mapping is CERT's job, not the agent's): the credentials are dummy
+// and the server ignores the signature. It exists because the shipped auth tests skip under mock
+// without keys, so the private response-mapping was never exercised - which is how these defects
+// reached review.
+func newPrivateTestExchange(t *testing.T, handler http.HandlerFunc) *Exchange {
+	t.Helper()
+	ex := new(Exchange)
+	require.NoError(t, testexch.Setup(ex), "Setup must not error")
+	ex.SetCredentials(&accounts.Credentials{Key: "test-key", Secret: "test-secret"})
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	b := ex.GetBase()
+	b.SkipAuthCheck = true
+	require.NoError(t, b.API.Endpoints.SetRunningURL(exchange.RestSpot.String(), srv.URL), "SetRunningURL must not error")
+	require.NoError(t, ex.setEnabledPairs(spotTradablePair), "setEnabledPairs must not error")
+	return ex
+}
+
+// jsonHandler routes on the request path suffix and writes the matching recorded body.
+func jsonHandler(t *testing.T, bySuffix map[string]string) http.HandlerFunc {
+	t.Helper()
+	return func(w http.ResponseWriter, r *http.Request) {
+		for suffix, body := range bySuffix {
+			if strings.HasSuffix(r.URL.Path, suffix) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(body))
+				return
+			}
+		}
+		t.Errorf("unexpected request path %q", r.URL.Path)
+		http.Error(w, "unexpected path", http.StatusNotFound)
+	}
+}
+
+// TestGetAccountFundingHistoryDepositTimestamp stamps the deposit at insertTime, not confirmTimes.
+// confirmTimes is a confirmation counter ("241"): decoding it as a timestamp failed to parse or
+// stamped 1970. Contract: group T defect #1.
+func TestGetAccountFundingHistoryDepositTimestamp(t *testing.T) {
+	t.Parallel()
+	const insertTime = 1704067200000 // 2024-01-01T00:00:00Z
+	ex := newPrivateTestExchange(t, jsonHandler(t, map[string]string{
+		"capital/deposit/hisrec": `[{"amount":"1.5","coin":"USDT","network":"TRC20","status":5,` +
+			`"address":"addr","txId":"txhash","confirmTimes":"241","insertTime":1704067200000}]`,
+		"capital/withdraw/history": `[]`,
+	}))
+	result, err := ex.GetAccountFundingHistory(t.Context())
+	require.NoError(t, err, "GetAccountFundingHistory must not error on a counter-valued confirmTimes")
+	require.Len(t, result, 1, "the single deposit must be relayed")
+	assert.Equal(t, int64(insertTime), result[0].Timestamp.UnixMilli(), "Timestamp must come from insertTime")
+	assert.Equal(t, "txhash", result[0].TransferID, "TransferID should be the txId")
+}
+
+// TestGetOrderHistoryPairAndTimestamps fills the pair and the order's real timestamps, and parses the
+// MEXC-specific IMMEDIATE_OR_CANCEL type instead of failing the whole query. Contract: group T
+// defects #2 and #3.
+func TestGetOrderHistoryPairAndTimestamps(t *testing.T) {
+	t.Parallel()
+	const (
+		created = 1704067200000
+		updated = 1704067260000
+	)
+	ex := newPrivateTestExchange(t, jsonHandler(t, map[string]string{
+		"allOrders": `[{"symbol":"BTCUSDT","orderId":"111","price":"50000","origQty":"0.5",` +
+			`"executedQty":"0.2","cummulativeQuoteQty":"10000","type":"IMMEDIATE_OR_CANCEL",` +
+			`"side":"BUY","status":"PARTIALLY_FILLED","time":1704067200000,"updateTime":1704067260000}]`,
+	}))
+	orders, err := ex.GetOrderHistory(t.Context(), &order.MultiOrderRequest{
+		AssetType: asset.Spot,
+		Pairs:     currency.Pairs{spotTradablePair},
+	})
+	require.NoError(t, err, "GetOrderHistory must not error on an IMMEDIATE_OR_CANCEL order")
+	require.Len(t, orders, 1, "the single order must be relayed")
+	assert.Equal(t, spotTradablePair, orders[0].Pair, "the pair must be filled in")
+	assert.False(t, orders[0].Date.IsZero(), "the creation time must be set")
+	assert.Equal(t, int64(created), orders[0].Date.UnixMilli(), "Date must come from time")
+	assert.Equal(t, int64(updated), orders[0].LastUpdated.UnixMilli(), "LastUpdated must come from updateTime")
+	assert.Equal(t, order.ImmediateOrCancel, orders[0].TimeInForce, "the IOC time-in-force must be preserved")
+}
+
+// TestUpdateAccountBalancesArithmetic reports free/locked as Total=free+locked, Hold=locked,
+// Free=free. Free was left unset, so available balance read as zero. Contract: group T defect #5.
+func TestUpdateAccountBalancesArithmetic(t *testing.T) {
+	t.Parallel()
+	ex := newPrivateTestExchange(t, jsonHandler(t, map[string]string{
+		"account": `{"accountType":"SPOT","canTrade":true,"balances":[{"asset":"USDT","free":"10","locked":"3"}]}`,
+	}))
+	subAccounts, err := ex.UpdateAccountBalances(t.Context(), asset.Spot)
+	require.NoError(t, err, "UpdateAccountBalances must not error")
+	require.Len(t, subAccounts, 1, "one sub-account must be returned")
+	bal := subAccounts[0].Balances[currency.USDT]
+	assert.Equal(t, 13.0, bal.Total, "Total must be free + locked")
+	assert.Equal(t, 3.0, bal.Hold, "Hold must be locked")
+	assert.Equal(t, 10.0, bal.Free, "Free must be the available (free) balance")
+}
+
+// TestCancelOrderFormatsSymbol sends the delimiter-free symbol the exchange expects. Contract: group
+// T defect #4 (symbol format).
+func TestCancelOrderFormatsSymbol(t *testing.T) {
+	t.Parallel()
+	var sentSymbol string
+	ex := newPrivateTestExchange(t, func(w http.ResponseWriter, r *http.Request) {
+		sentSymbol = r.URL.Query().Get("symbol")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"symbol":"BTCUSDT","orderId":"111"}`))
+	})
+	err := ex.CancelOrder(t.Context(), &order.Cancel{
+		OrderID:   "111",
+		AssetType: asset.Spot,
+		Pair:      currency.NewPairWithDelimiter("BTC", "USDT", "-"),
+	})
+	require.NoError(t, err, "CancelOrder must not error")
+	assert.Equal(t, "BTCUSDT", sentSymbol, "the cancel must send the delimiter-free symbol")
+}
+
+// TestCancelAllOrdersNoOrderID is a symbol-wide cancel: it must not require an order id. Contract:
+// group T defect #4 (StandardCancel removed from symbol-wide).
+func TestCancelAllOrdersNoOrderID(t *testing.T) {
+	t.Parallel()
+	ex := newPrivateTestExchange(t, jsonHandler(t, map[string]string{
+		"openOrders": `[]`,
+	}))
+	_, err := ex.CancelAllOrders(t.Context(), &order.Cancel{
+		AssetType: asset.Spot,
+		Pair:      spotTradablePair,
+	})
+	require.NotErrorIs(t, err, order.ErrOrderIDNotSet, "a symbol-wide cancel must not demand an order id")
+	require.NoError(t, err, "the symbol-wide cancel must proceed")
+}
+
+// TestGetFeeByTypeReturnsAmount returns the absolute fee (rate * price * quantity), not the bare
+// rate. Contract: group T defect #12.
+func TestGetFeeByTypeReturnsAmount(t *testing.T) {
+	t.Parallel()
+	ex := newPrivateTestExchange(t, jsonHandler(t, map[string]string{
+		"tradeFee": `{"code":0,"data":{"makerCommission":0.001,"takerCommission":0.002}}`,
+	}))
+	taker, err := ex.GetFeeByType(t.Context(), &exchange.FeeBuilder{
+		FeeType:       exchange.CryptocurrencyTradeFee,
+		Pair:          spotTradablePair,
+		PurchasePrice: 50000,
+		Amount:        0.5,
+	})
+	require.NoError(t, err, "GetFeeByType must not error")
+	assert.InDelta(t, 50.0, taker, 1e-9, "taker fee must be rate * price * quantity")
+}
+
+// TestOrderTypeStringPostOnlyAndTIF maps a limit order's time-in-force into MEXC's order type field:
+// post-only is LIMIT_MAKER and a limit IOC/FOK must not degrade to a plain LIMIT. Contract: group T
+// defect #10.
+func TestOrderTypeStringPostOnlyAndTIF(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		typ  order.Type
+		tif  order.TimeInForce
+		want string
+	}{
+		{"limit post-only is LIMIT_MAKER", order.Limit, order.PostOnly, typeLimitMaker},
+		{"limit IOC is preserved", order.Limit, order.ImmediateOrCancel, typeImmediateOrCancel},
+		{"limit FOK is preserved", order.Limit, order.FillOrKill, typeFillOrKill},
+		{"plain limit stays LIMIT", order.Limit, order.GoodTillCancel, typeLimit},
+		{"market IOC is preserved", order.Market, order.ImmediateOrCancel, typeImmediateOrCancel},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := e.OrderTypeStringFromOrderTypeAndTimeInForce(tc.typ, tc.tif)
+			require.NoError(t, err, "mapping must not error")
+			assert.Equal(t, tc.want, got, "order type string mismatch")
+		})
+	}
+}
+
+// TestStringToOrderTypeAndTimeInForceIOC asserts the reverse mapping recognises MEXC's own order
+// types (the generic parser rejects them). Contract: group T defect #2.
+func TestStringToOrderTypeAndTimeInForceIOC(t *testing.T) {
+	t.Parallel()
+	oType, tif, err := e.StringToOrderTypeAndTimeInForce(typeImmediateOrCancel)
+	require.NoError(t, err, "IMMEDIATE_OR_CANCEL must be recognised")
+	assert.Equal(t, order.ImmediateOrCancel, tif, "time-in-force must be IOC")
+	assert.Equal(t, order.Market, oType, "IOC maps to a market order type on MEXC")
+}

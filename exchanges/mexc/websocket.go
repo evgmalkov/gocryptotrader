@@ -755,18 +755,21 @@ func (e *Exchange) WsHandleData(ctx context.Context, conn websocket.Connection, 
 		if err != nil {
 			return err
 		}
-		amount, err := strconv.ParseFloat(body.Amount, 64)
+		// The fill's base size is quantity; amount is the quote value (price*quantity). trade.Data.Amount
+		// is base terms, so it must come from quantity. The trade id is tradeId - orderId identifies the
+		// order, not the individual fill, and would collide across a partially filled order's fills.
+		quantity, err := strconv.ParseFloat(body.Quantity, 64)
 		if err != nil {
 			return err
 		}
 		return e.Websocket.DataHandler.Send(ctx, []trade.Data{
 			{
-				TID:          body.OrderId,
+				TID:          body.TradeId,
 				Exchange:     e.Name,
 				CurrencyPair: cp,
 				AssetType:    asset.Spot,
 				Price:        price,
-				Amount:       amount,
+				Amount:       quantity,
 				Timestamp:    time.UnixMilli(body.Time),
 				Side: func() order.Side {
 					if body.TradeType == 1 {

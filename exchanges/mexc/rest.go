@@ -905,10 +905,18 @@ func (e *Exchange) newOrder(ctx context.Context, symbol currency.Pair, newClient
 
 // OrderTypeStringFromOrderTypeAndTimeInForce returns a string representation of an order.Type instance.
 func (e *Exchange) OrderTypeStringFromOrderTypeAndTimeInForce(oType order.Type, tif order.TimeInForce) (string, error) {
+	// MEXC spot carries the time-in-force in the order type field: there is no separate timeInForce
+	// parameter and no POST_ONLY type - post-only is LIMIT_MAKER. A limit order with IOC/FOK must be
+	// sent as IMMEDIATE_OR_CANCEL/FILL_OR_KILL or the constraint is silently dropped to a plain LIMIT.
 	switch oType {
 	case order.Limit:
-		if tif == order.PostOnly {
-			return typePostOnly, nil
+		switch tif {
+		case order.PostOnly:
+			return typeLimitMaker, nil
+		case order.ImmediateOrCancel:
+			return typeImmediateOrCancel, nil
+		case order.FillOrKill:
+			return typeFillOrKill, nil
 		}
 		return typeLimit, nil
 	case order.Market:
@@ -924,7 +932,7 @@ func (e *Exchange) OrderTypeStringFromOrderTypeAndTimeInForce(oType order.Type, 
 	case order.UnknownType:
 		switch tif {
 		case order.PostOnly:
-			return typePostOnly, nil
+			return typeLimitMaker, nil
 		case order.ImmediateOrCancel:
 			return typeImmediateOrCancel, nil
 		case order.FillOrKill:

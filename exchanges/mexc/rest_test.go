@@ -557,7 +557,7 @@ func TestOrderTypeString(t *testing.T) {
 		Error  error
 	}{
 		{Type: order.Limit}:                    {String: typeLimit},
-		{TimeInForce: order.PostOnly}:          {String: typePostOnly},
+		{TimeInForce: order.PostOnly}:          {String: typeLimitMaker},
 		{Type: order.Market}:                   {String: typeMarket},
 		{TimeInForce: order.ImmediateOrCancel}: {String: typeImmediateOrCancel},
 		{TimeInForce: order.FillOrKill}:        {String: typeFillOrKill},
@@ -1506,8 +1506,10 @@ func TestCancelAllOrders(t *testing.T) {
 	_, err := e.CancelAllOrders(t.Context(), nil)
 	require.ErrorIs(t, err, order.ErrCancelOrderIsNil)
 
+	// A symbol-wide cancel does not require an order id (group T defect #4): an empty request now
+	// fails on the unset asset, and supplying an order id changes nothing.
 	_, err = e.CancelAllOrders(t.Context(), &order.Cancel{})
-	require.ErrorIs(t, err, order.ErrOrderIDNotSet)
+	require.ErrorIs(t, err, asset.ErrNotSupported)
 
 	_, err = e.CancelAllOrders(t.Context(), &order.Cancel{OrderID: "12345"})
 	require.ErrorIs(t, err, asset.ErrNotSupported)
