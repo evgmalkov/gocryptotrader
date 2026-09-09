@@ -148,7 +148,7 @@ func TestLiveSpotKlineTimestamp(t *testing.T) {
 			}
 			ts := item.Candles[0].Time
 			t.Logf("candle time: %s (now %s)", ts.UTC(), time.Now().UTC())
-			assert.Greaterf(t, ts.Year(), 2023, "candle time %s must be recent, not the 1970 millisecond misread", ts.UTC())
+			assert.Greaterf(t, ts.Year(), 2023, "candle time %s should be recent, not the 1970 millisecond misread", ts.UTC())
 			assert.WithinDurationf(t, time.Now(), ts, 10*time.Minute, "candle time %s should be close to now", ts.UTC())
 			return
 		}
@@ -187,7 +187,7 @@ func TestLiveSpotUnsubscribe(t *testing.T) {
 	qualified := subs[0].QualifiedChannel
 
 	require.NoError(t, e.Subscribe(t.Context(), conn, subs), "Subscribe must not error")
-	require.True(t, hasActiveChannel(e, qualified), "the channel should be active after Subscribe")
+	require.True(t, hasActiveChannel(e, qualified), "the channel must be active after Subscribe")
 
 	require.NoError(t, e.Unsubscribe(t.Context(), conn, subs), "Unsubscribe must not error")
 	assert.Falsef(t, hasActiveChannel(e, qualified), "%s should be gone after Unsubscribe, not re-added", qualified)

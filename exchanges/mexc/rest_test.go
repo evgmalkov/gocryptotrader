@@ -194,7 +194,7 @@ func TestCandlesFromCandlestick(t *testing.T) {
 	got := candlesFromCandlestick([]*CandlestickData{&c})
 	require.Len(t, got, 1, "one candle must be produced")
 	assert.Equal(t, time.UnixMilli(1767056100000), got[0].Time, "candle time should be the open time")
-	assert.NotEqual(t, time.UnixMilli(1767056400000), got[0].Time, "candle time must not be the close time")
+	assert.NotEqual(t, time.UnixMilli(1767056400000), got[0].Time, "candle time should not be the close time")
 	assert.Equal(t, 87231.15, got[0].Open, "Open should be correct")
 	assert.Equal(t, 87250.54, got[0].Close, "Close should be correct")
 	assert.Equal(t, 87269.54, got[0].High, "High should be correct")
@@ -1313,7 +1313,7 @@ func TestUpdateOrderExecutionLimits(t *testing.T) {
 	// The price tick is 10^-quotePrecision, not the quoteAmountPrecision value: quoteAmountPrecision
 	// is the minimum quote order amount (min notional). The previous mapping put that amount into the
 	// price step, quantizing prices to whole quote units.
-	require.Equal(t, math.Pow(10, -symbolDetail.QuotePrecision), lms.PriceStepIncrementSize, "price tick should be 10^-quotePrecision")
+	require.Equal(t, math.Pow(10, -symbolDetail.QuotePrecision), lms.PriceStepIncrementSize, "price tick must be 10^-quotePrecision")
 	assert.Equal(t, symbolDetail.QuoteAmountPrecision.Float64(), lms.MinimumQuoteAmount, "quoteAmountPrecision should map to the minimum quote amount")
 	assert.Equal(t, math.Pow(10, -symbolDetail.BaseAssetPrecision), lms.AmountStepIncrementSize, "base amount step should be 10^-baseAssetPrecision")
 	assert.Equal(t, symbolDetail.BaseSizePrecision.Float64(), lms.MinimumBaseAmount)

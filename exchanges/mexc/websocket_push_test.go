@@ -95,7 +95,7 @@ func TestWsHandleKline(t *testing.T) {
 	assert.Equal(t, 92800.0, c.Low, "Low should be correct")
 	assert.Equal(t, 36.83803224, c.Volume, "Volume should come from the base-asset volume field")
 	assert.Equal(t, time.Unix(1736410500, 0), c.Time, "Time should be the window start read as seconds")
-	assert.Equal(t, 2025, c.Time.UTC().Year(), "the candle must not land in 1970 from a millisecond misread")
+	assert.Equal(t, 2025, c.Time.UTC().Year(), "the candle should not land in 1970 from a millisecond misread")
 }
 
 // TestWsHandleKlineUnknownInterval asserts an interval the exchange has not documented is reported
@@ -280,9 +280,9 @@ func TestWsHandlePrivateDeals(t *testing.T) {
 
 	trades := requireOneOf[[]trade.Data](t)
 	require.Len(t, trades, 1, "one trade must be relayed")
-	assert.Equal(t, "t-1", trades[0].TID, "TID must be the trade id, not the order id")
+	assert.Equal(t, "t-1", trades[0].TID, "TID should be the trade id, not the order id")
 	assert.Equal(t, 93220.00, trades[0].Price, "Price should be correct")
-	assert.Equal(t, 0.044, trades[0].Amount, "Amount must be the base quantity, not the quote amount")
+	assert.Equal(t, 0.044, trades[0].Amount, "Amount should be the base quantity, not the quote amount")
 	assert.Equal(t, order.Buy, trades[0].Side, "tradeType 1 should map to Buy")
 	assert.Equal(t, int64(1736409765051), trades[0].Timestamp.UnixMilli(), "Timestamp should come from the deal time")
 }

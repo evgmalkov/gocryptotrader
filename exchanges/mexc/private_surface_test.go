@@ -66,7 +66,7 @@ func TestGetAccountFundingHistoryDepositTimestamp(t *testing.T) {
 	result, err := ex.GetAccountFundingHistory(t.Context())
 	require.NoError(t, err, "GetAccountFundingHistory must not error on a counter-valued confirmTimes")
 	require.Len(t, result, 1, "the single deposit must be relayed")
-	assert.Equal(t, int64(insertTime), result[0].Timestamp.UnixMilli(), "Timestamp must come from insertTime")
+	assert.Equal(t, int64(insertTime), result[0].Timestamp.UnixMilli(), "Timestamp should come from insertTime")
 	assert.Equal(t, "txhash", result[0].TransferID, "TransferID should be the txId")
 }
 
@@ -90,11 +90,11 @@ func TestGetOrderHistoryPairAndTimestamps(t *testing.T) {
 	})
 	require.NoError(t, err, "GetOrderHistory must not error on an IMMEDIATE_OR_CANCEL order")
 	require.Len(t, orders, 1, "the single order must be relayed")
-	assert.Equal(t, spotTradablePair, orders[0].Pair, "the pair must be filled in")
-	assert.False(t, orders[0].Date.IsZero(), "the creation time must be set")
-	assert.Equal(t, int64(created), orders[0].Date.UnixMilli(), "Date must come from time")
-	assert.Equal(t, int64(updated), orders[0].LastUpdated.UnixMilli(), "LastUpdated must come from updateTime")
-	assert.Equal(t, order.ImmediateOrCancel, orders[0].TimeInForce, "the IOC time-in-force must be preserved")
+	assert.Equal(t, spotTradablePair, orders[0].Pair, "the pair should be filled in")
+	assert.False(t, orders[0].Date.IsZero(), "the creation time should be set")
+	assert.Equal(t, int64(created), orders[0].Date.UnixMilli(), "Date should come from time")
+	assert.Equal(t, int64(updated), orders[0].LastUpdated.UnixMilli(), "LastUpdated should come from updateTime")
+	assert.Equal(t, order.ImmediateOrCancel, orders[0].TimeInForce, "the IOC time-in-force should be preserved")
 }
 
 // TestUpdateAccountBalancesArithmetic reports free/locked as Total=free+locked, Hold=locked,
@@ -108,9 +108,9 @@ func TestUpdateAccountBalancesArithmetic(t *testing.T) {
 	require.NoError(t, err, "UpdateAccountBalances must not error")
 	require.Len(t, subAccounts, 1, "one sub-account must be returned")
 	bal := subAccounts[0].Balances[currency.USDT]
-	assert.Equal(t, 13.0, bal.Total, "Total must be free + locked")
-	assert.Equal(t, 3.0, bal.Hold, "Hold must be locked")
-	assert.Equal(t, 10.0, bal.Free, "Free must be the available (free) balance")
+	assert.Equal(t, 13.0, bal.Total, "Total should be free + locked")
+	assert.Equal(t, 3.0, bal.Hold, "Hold should be locked")
+	assert.Equal(t, 10.0, bal.Free, "Free should be the available (free) balance")
 }
 
 // TestCancelOrderFormatsSymbol sends the delimiter-free symbol the exchange expects. Contract: group
@@ -129,7 +129,7 @@ func TestCancelOrderFormatsSymbol(t *testing.T) {
 		Pair:      currency.NewPairWithDelimiter("BTC", "USDT", "-"),
 	})
 	require.NoError(t, err, "CancelOrder must not error")
-	assert.Equal(t, "BTCUSDT", sentSymbol, "the cancel must send the delimiter-free symbol")
+	assert.Equal(t, "BTCUSDT", sentSymbol, "the cancel should send the delimiter-free symbol")
 }
 
 // TestCancelAllOrdersNoOrderID is a symbol-wide cancel: it must not require an order id. Contract:
@@ -161,7 +161,7 @@ func TestGetFeeByTypeReturnsAmount(t *testing.T) {
 		Amount:        0.5,
 	})
 	require.NoError(t, err, "GetFeeByType must not error")
-	assert.InDelta(t, 50.0, taker, 1e-9, "taker fee must be rate * price * quantity")
+	assert.InDelta(t, 50.0, taker, 1e-9, "taker fee should be rate * price * quantity")
 }
 
 // TestOrderTypeStringPostOnlyAndTIF maps a limit order's time-in-force into MEXC's order type field:
@@ -196,7 +196,7 @@ func TestStringToOrderTypeAndTimeInForceIOC(t *testing.T) {
 	t.Parallel()
 	oType, tif, err := e.StringToOrderTypeAndTimeInForce(typeImmediateOrCancel)
 	require.NoError(t, err, "IMMEDIATE_OR_CANCEL must be recognised")
-	assert.Equal(t, order.ImmediateOrCancel, tif, "time-in-force must be IOC")
+	assert.Equal(t, order.ImmediateOrCancel, tif, "time-in-force should be IOC")
 	assert.Equal(t, order.Market, oType, "IOC maps to a market order type on MEXC")
 }
 
@@ -227,9 +227,9 @@ func TestActiveOrdersLastUpdatedFallback(t *testing.T) {
 	require.Len(t, orders, 2, "both open orders must be relayed")
 
 	// Fallback case: updateTime was null, so LastUpdated must fall back to the creation time.
-	assert.False(t, orders[0].LastUpdated.IsZero(), "LastUpdated must not be the zero time when updateTime is null")
-	assert.Equal(t, int64(created), orders[0].LastUpdated.UnixMilli(), "LastUpdated must fall back to time (creation) when updateTime is empty")
+	assert.False(t, orders[0].LastUpdated.IsZero(), "LastUpdated should not be the zero time when updateTime is null")
+	assert.Equal(t, int64(created), orders[0].LastUpdated.UnixMilli(), "LastUpdated should fall back to time (creation) when updateTime is empty")
 
 	// Positive case: a real updateTime must still be used verbatim (existing behaviour preserved).
-	assert.Equal(t, int64(updated), orders[1].LastUpdated.UnixMilli(), "LastUpdated must come from updateTime when it is present")
+	assert.Equal(t, int64(updated), orders[1].LastUpdated.UnixMilli(), "LastUpdated should come from updateTime when it is present")
 }
