@@ -771,12 +771,19 @@ func (e *Exchange) GetDepositAddress(ctx context.Context, code currency.Code, _,
 	if err != nil {
 		return nil, err
 	}
-	if len(result) != 1 {
+	if len(result) == 0 {
 		return nil, deposit.ErrAddressNotFound
+	}
+	// Without a pinned network the venue returns one address per network; take the first. The
+	// destination tag arrives as memo (the field table documents memo, not tag), so read memo and
+	// fall back to tag.
+	tag := result[0].Memo
+	if tag == "" {
+		tag = result[0].Tag
 	}
 	return &deposit.Address{
 		Address: result[0].Address,
-		Tag:     result[0].Tag,
+		Tag:     tag,
 		Chain:   result[0].Network,
 	}, nil
 }

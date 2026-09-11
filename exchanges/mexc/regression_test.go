@@ -17,6 +17,7 @@ import (
 	"github.com/thrasher-corp/gocryptotrader/encoding/json"
 	"github.com/thrasher-corp/gocryptotrader/exchange/accounts"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/asset"
+	"github.com/thrasher-corp/gocryptotrader/exchanges/deposit"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/order"
 	testexch "github.com/thrasher-corp/gocryptotrader/internal/testing/exchange"
 )
@@ -247,5 +248,43 @@ func TestGetOrderInfoPairAndTimestamps(t *testing.T) {
 		require.NoError(t, err, "GetOrderInfo must not error")
 		assert.False(t, detail.LastUpdated.IsZero(), "LastUpdated must not be the zero time when updateTime is absent")
 		assert.Equal(t, int64(1736409765000), detail.LastUpdated.UnixMilli(), "LastUpdated should fall back to the order time")
+	})
+}
+
+// TestGetDepositAddressMultiNetwork asserts GetDepositAddress copes with the list the venue returns
+// when no network is pinned (one address per network) by taking the first, and that the destination
+// tag is read from memo with a fallback to tag. Rejecting anything but a single-element list dropped
+// every multi-network coin. group T defect #6.
+func TestGetDepositAddressMultiNetwork(t *testing.T) {
+	t.Parallel()
+
+	t.Run("multi-network takes the first", func(t *testing.T) {
+		t.Parallel()
+		e := newSignedTestExchange(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`[{"coin":"USDT","network":"TRC20","address":"TAddr1"},{"coin":"USDT","network":"BEP20","address":"0xAddr2"},{"coin":"USDT","network":"ERC20","address":"0xAddr3"}]`))
+		}))
+		addr, err := e.GetDepositAddress(t.Context(), currency.USDT, "", "")
+		require.NoError(t, err, "GetDepositAddress must not reject a multi-network list")
+		assert.Equal(t, "TAddr1", addr.Address, "the first address should be returned")
+		assert.Equal(t, "TRC20", addr.Chain, "the chain should be the first entry's network")
+	})
+
+	t.Run("tag arrives as memo", func(t *testing.T) {
+		t.Parallel()
+		e := newSignedTestExchange(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`[{"coin":"EOS","network":"EOS","address":"eosaddr","memo":"MX10068"}]`))
+		}))
+		addr, err := e.GetDepositAddress(t.Context(), currency.NewCode("EOS"), "", "")
+		require.NoError(t, err, "GetDepositAddress must not error")
+		assert.Equal(t, "MX10068", addr.Tag, "the destination tag should be read from memo")
+	})
+
+	t.Run("empty list reports not found", func(t *testing.T) {
+		t.Parallel()
+		e := newSignedTestExchange(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`[]`))
+		}))
+		_, err := e.GetDepositAddress(t.Context(), currency.USDT, "", "")
+		assert.ErrorIs(t, err, deposit.ErrAddressNotFound, "an empty address list should report not found")
 	})
 }
