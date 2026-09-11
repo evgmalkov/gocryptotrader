@@ -737,9 +737,11 @@ func (e *Exchange) WsHandleData(ctx context.Context, conn websocket.Connection, 
 			AssetType: asset.Spot,
 			Balance: accounts.Balance{
 				Currency: currency.NewCode(body.VcoinName),
-				Total:    balanceAmount,
-				Hold:     frozenAmount,
-				Free:     balanceAmount - frozenAmount,
+				// balanceAmount is available and frozenAmount is frozen; total is their sum. This
+				// matches UpdateAccountBalances over REST (Total = free + locked).
+				Total: balanceAmount + frozenAmount,
+				Hold:  frozenAmount,
+				Free:  balanceAmount,
 			},
 		})
 	case channelPrivateDealsV3:

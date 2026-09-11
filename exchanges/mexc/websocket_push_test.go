@@ -259,10 +259,12 @@ func TestWsHandlePrivateAccount(t *testing.T) {
 	require.NoError(t, e.WsHandleData(t.Context(), nil, raw), "WsHandleData must not error")
 
 	change := requireOneOf[accounts.Change](t)
+	// balanceAmount is the available balance and frozenAmount is the frozen part, so total is their
+	// sum, free is balanceAmount and hold is frozenAmount - matching UpdateAccountBalances over REST.
 	assert.Equal(t, currency.USDT, change.Balance.Currency, "Currency should be correct")
-	assert.Equal(t, 100.5, change.Balance.Total, "Total should be the balance amount")
+	assert.Equal(t, 101.0, change.Balance.Total, "Total should be available plus frozen")
 	assert.Equal(t, 0.5, change.Balance.Hold, "Hold should be the frozen amount")
-	assert.Equal(t, 100.0, change.Balance.Free, "Free should be the balance less the frozen amount")
+	assert.Equal(t, 100.5, change.Balance.Free, "Free should be the available balance amount")
 	assert.Equal(t, asset.Spot, change.AssetType, "AssetType should be correct")
 }
 
