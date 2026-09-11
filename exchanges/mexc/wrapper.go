@@ -732,9 +732,12 @@ func (e *Exchange) GetOrderInfo(ctx context.Context, orderID string, pair curren
 				return nil, err
 			}
 		}
-		cp, err := currency.NewPairFromString(result.Symbol)
-		if err != nil {
-			return nil, err
+		// The Query Order response carries time and updateTime but no transactTime (that field only
+		// exists on the New Order response), so LastUpdated must come from updateTime and fall back to
+		// the creation time when the order is still open (updateTime null decodes to the zero time).
+		lastUpdated := result.UpdateTime.Time()
+		if lastUpdated.IsZero() {
+			lastUpdated = result.Time.Time()
 		}
 		return &order.Detail{
 			Price:                result.Price.Float64(),
@@ -750,9 +753,12 @@ func (e *Exchange) GetOrderInfo(ctx context.Context, orderID string, pair curren
 			Side:                 oSide,
 			Status:               oStatus,
 			AssetType:            asset.Spot,
-			LastUpdated:          result.TransactTime.Time(),
-			Pair:                 cp,
-			TimeInForce:          tif,
+			Date:                 result.Time.Time(),
+			LastUpdated:          lastUpdated,
+			// pair is the pair the caller asked for; the response symbol is concatenated and a naive
+			// split mis-reads most MEXC symbols (METALUSDT read as MET/ALUSDT).
+			Pair:        pair.Format(pairFormat),
+			TimeInForce: tif,
 		}, nil
 	default:
 		return nil, fmt.Errorf("%w: asset type: %v", order.ErrAssetNotSet, assetType)

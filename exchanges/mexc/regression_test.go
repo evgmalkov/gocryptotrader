@@ -216,3 +216,36 @@ func TestSubmitOrderPairFromRequest(t *testing.T) {
 	assert.Equal(t, currency.NewCode("METAL"), resp.Pair.Base, "the response pair base should be METAL, not a mis-split of METALUSDT")
 	assert.Equal(t, currency.USDT, resp.Pair.Quote, "the response pair quote should be USDT")
 }
+
+// TestGetOrderInfoPairAndTimestamps asserts GetOrderInfo reports the requested pair (not one re-split
+// from the concatenated response symbol) and both timestamps. The Query Order response carries time
+// and updateTime but no transactTime (that field only exists on the New Order response), so reading
+// LastUpdated from transactTime left both timestamps at the zero time. group T defect #4.
+func TestGetOrderInfoPairAndTimestamps(t *testing.T) {
+	t.Parallel()
+	metalUSDT := currency.NewPair(currency.NewCode("METAL"), currency.USDT)
+
+	t.Run("both timestamps present", func(t *testing.T) {
+		t.Parallel()
+		e := newSignedTestExchange(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"symbol":"METALUSDT","orderId":"1","clientOrderId":"c1","price":"2.5","origQty":"10","executedQty":"4","cummulativeQuoteQty":"10","type":"LIMIT","side":"BUY","status":"PARTIALLY_FILLED","time":1736409765000,"updateTime":1736409770000}`))
+		}))
+		detail, err := e.GetOrderInfo(t.Context(), "1", metalUSDT, asset.Spot)
+		require.NoError(t, err, "GetOrderInfo must not error")
+		assert.Equal(t, currency.NewCode("METAL"), detail.Pair.Base, "Pair base should be METAL, not a mis-split of METALUSDT")
+		assert.Equal(t, currency.USDT, detail.Pair.Quote, "Pair quote should be USDT")
+		assert.Equal(t, int64(1736409765000), detail.Date.UnixMilli(), "Date should come from the order time")
+		assert.Equal(t, int64(1736409770000), detail.LastUpdated.UnixMilli(), "LastUpdated should come from updateTime")
+	})
+
+	t.Run("updateTime absent falls back to time", func(t *testing.T) {
+		t.Parallel()
+		e := newSignedTestExchange(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"symbol":"METALUSDT","orderId":"1","price":"2.5","origQty":"10","executedQty":"0","type":"LIMIT","side":"BUY","status":"NEW","time":1736409765000}`))
+		}))
+		detail, err := e.GetOrderInfo(t.Context(), "1", metalUSDT, asset.Spot)
+		require.NoError(t, err, "GetOrderInfo must not error")
+		assert.False(t, detail.LastUpdated.IsZero(), "LastUpdated must not be the zero time when updateTime is absent")
+		assert.Equal(t, int64(1736409765000), detail.LastUpdated.UnixMilli(), "LastUpdated should fall back to the order time")
+	})
+}
