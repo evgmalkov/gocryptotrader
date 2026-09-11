@@ -2658,7 +2658,7 @@
        "6339710.08"
       ]
      ],
-     "queryString": "endTime=1767204600000&interval=5m&limit=1000&startTime=1767204000000&symbol=BTCUSDT",
+     "queryString": "endTime=1767204600000&interval=5m&limit=500&startTime=1767204000000&symbol=BTCUSDT",
      "bodyParams": "",
      "headers": {
       "Content-Type": [

@@ -80,7 +80,10 @@ func (e *Exchange) SetDefaults() {
 					kline.IntervalCapacity{Interval: kline.OneWeek},
 					kline.IntervalCapacity{Interval: kline.OneMonth},
 				),
-				GlobalResultLimit: 1000,
+				// /api/v3/klines returns at most 500 rows whatever limit is asked for, so each range
+				// GetKlineExtendedRequest carves must be sized at 500; a larger limit fills a range half
+				// way and zero-pads the remainder silently.
+				GlobalResultLimit: 500,
 			},
 		},
 		Subscriptions: defaultSubscriptions.Clone(),

@@ -1285,6 +1285,14 @@ func TestGetHistoricCandlesExtended(t *testing.T) {
 	require.ErrorIs(t, err, asset.ErrNotSupported)
 }
 
+// TestKlineGlobalResultLimit pins the kline page size. MEXC's /api/v3/klines returns at most 500 rows
+// however large a limit is requested, so a GlobalResultLimit of 1000 makes GetHistoricCandlesExtended
+// size each range at 1000 candles, fill it half way, and zero-pad the remainder silently.
+func TestKlineGlobalResultLimit(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, uint64(500), e.Features.Enabled.Kline.GlobalResultLimit, "MEXC klines return at most 500 rows, so the global result limit must be 500")
+}
+
 func TestGetServerTime(t *testing.T) {
 	t.Parallel()
 	sTime, err := e.GetServerTime(t.Context(), asset.Empty)
