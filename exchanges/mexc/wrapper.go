@@ -811,10 +811,13 @@ func (e *Exchange) WithdrawFiatFundsToInternationalBank(context.Context, *withdr
 // order's real timestamps, and GetOrderHistory parsed the type with the generic order.StringToOrderType,
 // which does not know MEXC's IMMEDIATE_OR_CANCEL/FILL_OR_KILL/LIMIT_MAKER types and failed the whole
 // query, returning nothing.
-func (e *Exchange) orderDetailFromRESTOrder(o *OrderDetail) (order.Detail, error) {
+func (e *Exchange) orderDetailFromRESTOrder(o *OrderDetail, fallbackPair currency.Pair) (order.Detail, error) {
+	// A symbol that has left the available pairs (delisted with a working order, or a catalogue not
+	// yet refreshed) must not sink the whole listing; fall back to the pair the caller asked for
+	// instead of failing, the same way UpdateTickers skips an untracked symbol rather than erroring.
 	pair, err := e.MatchSymbolWithAvailablePairs(o.Symbol, asset.Spot, false)
 	if err != nil {
-		return order.Detail{}, err
+		pair = fallbackPair
 	}
 	oType, tif, err := e.StringToOrderTypeAndTimeInForce(o.Type)
 	if err != nil {
@@ -876,7 +879,7 @@ func (e *Exchange) GetActiveOrders(ctx context.Context, getOrdersRequest *order.
 				return nil, err
 			}
 			for r := range result {
-				detail, err := e.orderDetailFromRESTOrder(result[r])
+				detail, err := e.orderDetailFromRESTOrder(result[r], getOrdersRequest.Pairs[p].Format(pairFormat))
 				if err != nil {
 					return nil, err
 				}
@@ -908,7 +911,7 @@ func (e *Exchange) GetOrderHistory(ctx context.Context, getOrdersRequest *order.
 		}
 		orderDetails := make(order.FilteredOrders, len(result))
 		for r := range result {
-			detail, err := e.orderDetailFromRESTOrder(result[r])
+			detail, err := e.orderDetailFromRESTOrder(result[r], pair)
 			if err != nil {
 				return nil, err
 			}

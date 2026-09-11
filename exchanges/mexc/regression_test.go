@@ -288,3 +288,27 @@ func TestGetDepositAddressMultiNetwork(t *testing.T) {
 		assert.ErrorIs(t, err, deposit.ErrAddressNotFound, "an empty address list should report not found")
 	})
 }
+
+// TestGetActiveOrdersToleratesUncatalogedSymbol asserts that one order whose symbol is no longer in
+// the available pairs (delisted with a working order, or a catalogue not yet refreshed) does not sink
+// the whole listing. The catalogued order must still be returned. group T defect #8.
+func TestGetActiveOrdersToleratesUncatalogedSymbol(t *testing.T) {
+	t.Parallel()
+	e := newSignedTestExchange(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`[{"symbol":"BTCUSDT","orderId":"b1","price":"20000","origQty":"1","executedQty":"0","type":"LIMIT","side":"BUY","status":"NEW","time":1736409765000},{"symbol":"DOGEUSDT","orderId":"d1","price":"0.1","origQty":"100","executedQty":"0","type":"LIMIT","side":"BUY","status":"NEW","time":1736409765000}]`))
+	}))
+	btc := currency.NewPair(currency.BTC, currency.USDT)
+	require.NoError(t, e.CurrencyPairs.StorePairs(asset.Spot, currency.Pairs{btc}, false), "storing available pairs must not error")
+	require.NoError(t, e.CurrencyPairs.StorePairs(asset.Spot, currency.Pairs{btc}, true), "storing enabled pairs must not error")
+
+	orders, err := e.GetActiveOrders(t.Context(), &order.MultiOrderRequest{AssetType: asset.Spot, Pairs: currency.Pairs{btc}})
+	require.NoError(t, err, "GetActiveOrders must not fail the whole listing because of one uncataloged symbol")
+	require.NotEmpty(t, orders, "the catalogued order must still be returned")
+	var found bool
+	for i := range orders {
+		if orders[i].OrderID == "b1" {
+			found = true
+		}
+	}
+	assert.True(t, found, "the catalogued BTCUSDT order should be present in the listing")
+}
