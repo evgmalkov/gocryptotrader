@@ -433,3 +433,43 @@ func TestAuthRequestSignsQueryAndBody(t *testing.T) {
 	require.NoError(t, err, "GetHMAC must not error")
 	assert.Equal(t, hex.EncodeToString(expected), sig, "the signature must cover the query string plus the request body")
 }
+
+// TestExtendListenKey asserts the user data stream keepalive is a PUT to userDataStream carrying the
+// listen key. The private stream closes 60 minutes after creation unless a keepalive is sent, and
+// nothing renewed it. group T defect #13.
+func TestExtendListenKey(t *testing.T) {
+	t.Parallel()
+
+	t.Run("builds the PUT request", func(t *testing.T) {
+		t.Parallel()
+		var (
+			mu        sync.Mutex
+			gotMethod string
+			gotPath   string
+			gotKey    string
+			gotAPIKey string
+		)
+		e := newSignedTestExchange(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			gotMethod = r.Method
+			gotPath = r.URL.Path
+			gotKey = r.URL.Query().Get("listenKey")
+			gotAPIKey = r.Header.Get("X-MEXC-APIKEY")
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		require.NoError(t, e.ExtendListenKey(t.Context(), "LISTEN123"), "ExtendListenKey must not error")
+		assert.Equal(t, http.MethodPut, gotMethod, "the keepalive should be a PUT")
+		assert.Contains(t, gotPath, "/api/v3/userDataStream", "the keepalive should target userDataStream")
+		assert.Equal(t, "LISTEN123", gotKey, "the keepalive should carry the listen key")
+		assert.NotEmpty(t, gotAPIKey, "the keepalive should be authenticated")
+	})
+
+	t.Run("rejects an empty listen key", func(t *testing.T) {
+		t.Parallel()
+		e := newSignedTestExchange(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		assert.Error(t, e.ExtendListenKey(t.Context(), ""), "an empty listen key must be rejected")
+	})
+}

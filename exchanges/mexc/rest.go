@@ -35,6 +35,9 @@ type Exchange struct {
 	// clear the marks of all.
 	orderbookSnapshotLoadedPairs map[string]bool
 	syncOrderbookPairsLock       sync.Mutex
+	// wsListenKey is the user data stream key created on WsConnect; the keepalive goroutine renews it.
+	wsListenKey   string
+	wsListenKeyMu sync.Mutex
 }
 
 const (
@@ -52,6 +55,7 @@ var (
 	errTransactionIDRequired      = errors.New("missing transaction ID")
 	errPaginationLimitIsRequired  = errors.New("limit is required")
 	errBatchOrderRejected         = errors.New("batch order rejected")
+	errListenKeyRequired          = errors.New("listen key is required")
 )
 
 // GetSymbols retrieves current exchange trading rules and symbol information
@@ -1438,6 +1442,18 @@ func (e *Exchange) GenerateListenKey(ctx context.Context) (string, error) {
 		ListenKey string `json:"listenKey"`
 	}
 	return resp.ListenKey, e.SendHTTPRequest(ctx, exchange.RestSpot, request.Auth, http.MethodPost, "userDataStream", nil, nil, &resp, true)
+}
+
+// ExtendListenKey renews the user data stream so it stays open past its 60-minute expiry. The stream
+// closes 60 minutes after creation unless a keepalive PUT is sent; WsConnect creates the key once, so
+// without this the private stream silently dies after an hour.
+func (e *Exchange) ExtendListenKey(ctx context.Context, listenKey string) error {
+	if listenKey == "" {
+		return errListenKeyRequired
+	}
+	values := url.Values{}
+	values.Set("listenKey", listenKey)
+	return e.SendHTTPRequest(ctx, exchange.RestSpot, request.Auth, http.MethodPut, "userDataStream", values, nil, nil, true)
 }
 
 // SendHTTPRequest sends an http request to a desired path with a JSON payload (of present)

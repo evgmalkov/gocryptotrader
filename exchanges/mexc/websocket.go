@@ -99,7 +99,10 @@ func (e *Exchange) WsConnect(ctx context.Context, conn websocket.Connection) err
 		if err != nil {
 			return err
 		}
+		e.setWsListenKey(listenKey)
 		conn.SetURL(conn.GetURL() + "?listenKey=" + listenKey)
+		// The stream closes 60 minutes after creation unless a keepalive is sent; renew it on a timer.
+		go e.keepListenKeyAlive(ctx)
 	}
 	if err := conn.Dial(ctx, &gws.Dialer{
 		EnableCompression: true,
@@ -114,6 +117,42 @@ func (e *Exchange) WsConnect(ctx context.Context, conn websocket.Connection) err
 		Delay:       time.Second * 20,
 	})
 	return nil
+}
+
+// listenKeyKeepAliveInterval renews the user data stream well within its 60-minute expiry.
+const listenKeyKeepAliveInterval = 30 * time.Minute
+
+func (e *Exchange) setWsListenKey(key string) {
+	e.wsListenKeyMu.Lock()
+	e.wsListenKey = key
+	e.wsListenKeyMu.Unlock()
+}
+
+func (e *Exchange) getWsListenKey() string {
+	e.wsListenKeyMu.Lock()
+	defer e.wsListenKeyMu.Unlock()
+	return e.wsListenKey
+}
+
+// keepListenKeyAlive renews the user data stream on a timer for as long as the connection lives. The
+// stream closes 60 minutes after creation unless a keepalive PUT is sent, so a stream left unrenewed
+// silently stops delivering private updates after an hour; the PING handler keeps the socket open but
+// does not touch the key.
+func (e *Exchange) keepListenKeyAlive(ctx context.Context) {
+	e.Websocket.Wg.Add(1)
+	defer e.Websocket.Wg.Done()
+	renew := time.NewTicker(listenKeyKeepAliveInterval)
+	defer renew.Stop()
+	for {
+		select {
+		case <-e.Websocket.ShutdownC:
+			return
+		case <-renew.C:
+			if err := e.ExtendListenKey(ctx, e.getWsListenKey()); err != nil {
+				_ = e.Websocket.DataHandler.Send(ctx, err)
+			}
+		}
+	}
 }
 
 // Subscribe subscribes to a channel
