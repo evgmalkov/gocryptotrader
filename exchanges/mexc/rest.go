@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -1496,9 +1497,7 @@ func (e *Exchange) SendHTTPRequest(ctx context.Context, ep exchange.URL, epl req
 			}
 			headers["X-MEXC-APIKEY"] = creds.Key
 			signed := url.Values{}
-			for k, v := range values {
-				signed[k] = v
-			}
+			maps.Copy(signed, values)
 			signed.Set("recvWindow", "5000")
 			signed.Set("timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
 			// MEXC signs totalParams = query string + request body; keep the signature out of the

@@ -301,7 +301,7 @@ func TestGetActiveOrdersToleratesUncatalogedSymbol(t *testing.T) {
 	e := newSignedTestExchange(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`[{"symbol":"BTCUSDT","orderId":"b1","price":"20000","origQty":"1","executedQty":"0","type":"LIMIT","side":"BUY","status":"NEW","time":1736409765000},{"symbol":"DOGEUSDT","orderId":"d1","price":"0.1","origQty":"100","executedQty":"0","type":"LIMIT","side":"BUY","status":"NEW","time":1736409765000}]`))
 	}))
-	btc := currency.NewPair(currency.BTC, currency.USDT)
+	btc := currency.NewBTCUSDT()
 	require.NoError(t, e.CurrencyPairs.StorePairs(asset.Spot, currency.Pairs{btc}, false), "storing available pairs must not error")
 	require.NoError(t, e.CurrencyPairs.StorePairs(asset.Spot, currency.Pairs{btc}, true), "storing enabled pairs must not error")
 
@@ -326,7 +326,7 @@ func TestUpdateOrderbookStampsVenueTime(t *testing.T) {
 	e := newSignedTestExchange(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"lastUpdateId":123456,"bids":[["20000","1"]],"asks":[["20001","2"]],"timestamp":1736409765000}`))
 	}))
-	btc := currency.NewPair(currency.BTC, currency.USDT)
+	btc := currency.NewBTCUSDT()
 	require.NoError(t, e.CurrencyPairs.StorePairs(asset.Spot, currency.Pairs{btc}, false), "storing available pairs must not error")
 	require.NoError(t, e.CurrencyPairs.StorePairs(asset.Spot, currency.Pairs{btc}, true), "storing enabled pairs must not error")
 
