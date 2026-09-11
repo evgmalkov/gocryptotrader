@@ -17,6 +17,7 @@ import (
 	"github.com/thrasher-corp/gocryptotrader/encoding/json"
 	"github.com/thrasher-corp/gocryptotrader/exchange/accounts"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/asset"
+	"github.com/thrasher-corp/gocryptotrader/exchanges/order"
 	testexch "github.com/thrasher-corp/gocryptotrader/internal/testing/exchange"
 )
 
@@ -191,4 +192,27 @@ func TestGetOrderInfoAmountIsBaseQuantity(t *testing.T) {
 	assert.Zero(t, detail.ContractAmount, "a spot order has no contract amount")
 	assert.Equal(t, 0.2, detail.ExecutedAmount, "ExecutedAmount should carry executedQty")
 	assert.InDelta(t, 0.3, detail.RemainingAmount, 1e-9, "RemainingAmount should be origQty minus executedQty")
+}
+
+// TestSubmitOrderPairFromRequest asserts SubmitOrder reports the pair the caller submitted rather than
+// one re-parsed from the response symbol. The venue echoes the symbol concatenated without a
+// delimiter, and a naive split mis-reads most MEXC symbols (METALUSDT read as MET/ALUSDT). group T
+// defect #3.
+func TestSubmitOrderPairFromRequest(t *testing.T) {
+	t.Parallel()
+	e := newSignedTestExchange(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"symbol":"METALUSDT","orderId":"1","clientOrderId":"c1","price":"2.5","origQty":"10","executedQty":"0","type":"LIMIT","side":"BUY","status":"NEW","transactTime":1736409765052}`))
+	}))
+	resp, err := e.SubmitOrder(t.Context(), &order.Submit{
+		Exchange:  e.Name,
+		Pair:      currency.NewPair(currency.NewCode("METAL"), currency.USDT),
+		AssetType: asset.Spot,
+		Side:      order.Buy,
+		Type:      order.Limit,
+		Amount:    10,
+		Price:     2.5,
+	})
+	require.NoError(t, err, "SubmitOrder must not error")
+	assert.Equal(t, currency.NewCode("METAL"), resp.Pair.Base, "the response pair base should be METAL, not a mis-split of METALUSDT")
+	assert.Equal(t, currency.USDT, resp.Pair.Quote, "the response pair quote should be USDT")
 }

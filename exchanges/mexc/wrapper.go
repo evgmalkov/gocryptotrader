@@ -604,10 +604,6 @@ func (e *Exchange) SubmitOrder(ctx context.Context, s *order.Submit) (*order.Sub
 		if err != nil {
 			return nil, err
 		}
-		cp, err := currency.NewPairFromString(result.Symbol)
-		if err != nil {
-			return nil, err
-		}
 		var ordStatus order.Status
 		if result.Status != "" {
 			ordStatus, err = orderStatusFromString(result.Status)
@@ -616,7 +612,9 @@ func (e *Exchange) SubmitOrder(ctx context.Context, s *order.Submit) (*order.Sub
 			}
 		}
 		return &order.SubmitResponse{
-			Pair:                 cp,
+			// s.Pair is already in exchange format; the response symbol is concatenated and a naive
+			// split mis-reads most MEXC symbols (METALUSDT read as MET/ALUSDT).
+			Pair:                 s.Pair,
 			Exchange:             e.Name,
 			Type:                 orderType,
 			Side:                 orderSide,
