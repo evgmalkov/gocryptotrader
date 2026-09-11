@@ -312,3 +312,22 @@ func TestGetActiveOrdersToleratesUncatalogedSymbol(t *testing.T) {
 	}
 	assert.True(t, found, "the catalogued BTCUSDT order should be present in the listing")
 }
+
+// TestUpdateOrderbookStampsVenueTime asserts the REST orderbook carries the venue's own timestamp and
+// update id rather than being stamped with the local clock. The depth payload decodes both, but they
+// were never copied onto the book, so Process fell back to time.Now() and a zero update id. group T
+// defect #10.
+func TestUpdateOrderbookStampsVenueTime(t *testing.T) {
+	t.Parallel()
+	e := newSignedTestExchange(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"lastUpdateId":123456,"bids":[["20000","1"]],"asks":[["20001","2"]],"timestamp":1736409765000}`))
+	}))
+	btc := currency.NewPair(currency.BTC, currency.USDT)
+	require.NoError(t, e.CurrencyPairs.StorePairs(asset.Spot, currency.Pairs{btc}, false), "storing available pairs must not error")
+	require.NoError(t, e.CurrencyPairs.StorePairs(asset.Spot, currency.Pairs{btc}, true), "storing enabled pairs must not error")
+
+	ob, err := e.UpdateOrderbook(t.Context(), btc, asset.Spot)
+	require.NoError(t, err, "UpdateOrderbook must not error")
+	assert.Equal(t, int64(123456), ob.LastUpdateID, "LastUpdateID should be read from the venue response")
+	assert.Equal(t, int64(1736409765000), ob.LastUpdated.UnixMilli(), "LastUpdated should be the venue timestamp, not the local clock")
+}

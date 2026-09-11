@@ -336,6 +336,10 @@ func (e *Exchange) UpdateOrderbook(ctx context.Context, pair currency.Pair, asse
 		}
 		book.Bids = result.Bids.Levels()
 		book.Asks = result.Asks.Levels()
+		// The venue carries its own timestamp and update id; the same correction as wsSendTime on the
+		// ws side. Without them Process falls back to time.Now() and a zero update id.
+		book.LastUpdated = result.Timestamp.Time()
+		book.LastUpdateID = result.LastUpdateID
 		if err := book.Process(); err != nil {
 			return book, err
 		}
