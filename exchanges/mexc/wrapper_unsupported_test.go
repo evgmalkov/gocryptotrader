@@ -56,14 +56,17 @@ func TestUnsupportedOperations(t *testing.T) {
 }
 
 // TestGetFeeByTypeOffline asserts the offline fee estimate, which is the path taken when no
-// credentials are available to ask the exchange for the account's own schedule.
+// credentials are available to ask the exchange for the account's own schedule. GetFeeByType returns
+// the absolute fee amount (rate * price * quantity), not the bare rate; the offline branch must apply
+// the same calculation against a fixed worst-case rate so both branches speak the same unit. group T
+// defect #5.
 func TestGetFeeByTypeOffline(t *testing.T) {
 	t.Parallel()
-	maker, err := e.GetFeeByType(t.Context(), &exchange.FeeBuilder{FeeType: exchange.OfflineTradeFee, IsMaker: true})
+	maker, err := e.GetFeeByType(t.Context(), &exchange.FeeBuilder{FeeType: exchange.OfflineTradeFee, IsMaker: true, PurchasePrice: 50000, Amount: 0.5})
 	require.NoError(t, err, "the offline maker fee must not error")
 	assert.Zero(t, maker, "MEXC spot charges no maker fee")
 
-	taker, err := e.GetFeeByType(t.Context(), &exchange.FeeBuilder{FeeType: exchange.OfflineTradeFee})
+	taker, err := e.GetFeeByType(t.Context(), &exchange.FeeBuilder{FeeType: exchange.OfflineTradeFee, PurchasePrice: 50000, Amount: 0.5})
 	require.NoError(t, err, "the offline taker fee must not error")
-	assert.Equal(t, 0.0005, taker, "the offline taker fee should be 5 bps")
+	assert.Equal(t, 12.5, taker, "the offline taker fee should be 5 bps of the trade value (0.0005 * 50000 * 0.5)")
 }

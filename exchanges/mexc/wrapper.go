@@ -915,16 +915,16 @@ func (e *Exchange) GetOrderHistory(ctx context.Context, getOrdersRequest *order.
 
 // GetFeeByType returns an estimate of fee based on the type of transaction
 func (e *Exchange) GetFeeByType(ctx context.Context, feeBuilder *exchange.FeeBuilder) (float64, error) {
-	// GetFeeByType returns the absolute fee amount for a live trade, not the fee rate. The amount is
-	// rate * price * quantity; returning the bare rate reported e.g. 0.002 as if it were the fee.
-	// The OfflineTradeFee branch is a fixed worst-case estimate used when the live rate cannot be
-	// fetched (asserted by TestGetFeeByTypeOffline) and is left as-is.
+	// GetFeeByType returns the absolute fee amount, not the rate. The amount is rate * price * quantity;
+	// returning the bare rate reported e.g. 0.0005 as if it were the fee. The offline branch is the
+	// same calculation against a fixed worst-case rate, used when no credentials are available to ask
+	// the exchange for the account's own schedule.
 	switch feeBuilder.FeeType {
 	case exchange.OfflineTradeFee:
 		if feeBuilder.IsMaker {
 			return 0., nil
 		}
-		return 0.0005, nil
+		return 0.0005 * feeBuilder.PurchasePrice * feeBuilder.Amount, nil
 	case exchange.CryptocurrencyTradeFee:
 		result, err := e.GetSymbolTradingFee(ctx, feeBuilder.Pair)
 		if err != nil {
