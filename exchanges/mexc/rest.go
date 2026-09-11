@@ -1452,41 +1452,50 @@ func (e *Exchange) SendHTTPRequest(ctx context.Context, ep exchange.URL, epl req
 	}
 	headers := make(map[string]string)
 	headers["Content-Type"] = "application/json"
-	var authType request.AuthType
-	authType = request.UnauthenticatedRequest
-	if len(auth) > 0 && auth[0] {
+	var authType request.AuthType = request.UnauthenticatedRequest
+	authed := len(auth) > 0 && auth[0]
+	if authed {
 		authType = request.AuthenticatedRequest
-		creds, err := e.GetCredentials(ctx)
-		if err != nil {
-			return err
-		}
-		headers["X-MEXC-APIKEY"] = creds.Key
-		if values == nil {
-			values = url.Values{}
-		}
-		values.Set("recvWindow", "5000")
-		values.Set("timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
-		hmac, err := crypto.GetHMAC(crypto.HashSHA256,
-			[]byte(values.Encode()),
-			[]byte(creds.Secret))
-		if err != nil {
-			return err
-		}
-		values.Set("signature", hex.EncodeToString(hmac))
 	}
 	var payload string
 	if arg != nil {
-		var byteData []byte
-		byteData, err = json.Marshal(arg)
+		byteData, err := json.Marshal(arg)
 		if err != nil {
 			return err
 		}
 		payload = string(byteData)
 	}
-	err = e.SendPayload(ctx, epl, func() (*request.Item, error) {
+	// Sign inside the closure: doRequest re-invokes it (after InitiateRateLimit) on every attempt, so
+	// a timestamp minted once before the first attempt goes stale on a rate-limit wait or 429 retry
+	// (recvWindow exceeded) and is rejected. Sign a fresh copy of the caller's values each time so the
+	// signing fields never accumulate across attempts. SendPayload already tags an authenticated
+	// failure with ErrAuthRequestFailed, so the error is returned unwrapped to keep the transport
+	// error matchable with errors.Is.
+	return e.SendPayload(ctx, epl, func() (*request.Item, error) {
+		path := ePoint + versionStr + common.EncodeURLValues(requestPath, values)
+		if authed {
+			creds, err := e.GetCredentials(ctx)
+			if err != nil {
+				return nil, err
+			}
+			headers["X-MEXC-APIKEY"] = creds.Key
+			signed := url.Values{}
+			for k, v := range values {
+				signed[k] = v
+			}
+			signed.Set("recvWindow", "5000")
+			signed.Set("timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
+			// MEXC signs totalParams = query string + request body; keep the signature out of the
+			// signed values and append it to the query so a retry never signs a stale signature.
+			mac, err := crypto.GetHMAC(crypto.HashSHA256, []byte(signed.Encode()+payload), []byte(creds.Secret))
+			if err != nil {
+				return nil, err
+			}
+			path = ePoint + versionStr + common.EncodeURLValues(requestPath, signed) + "&signature=" + hex.EncodeToString(mac)
+		}
 		return &request.Item{
 			Method:        method,
-			Path:          ePoint + versionStr + common.EncodeURLValues(requestPath, values),
+			Path:          path,
 			Headers:       headers,
 			Body:          strings.NewReader(payload),
 			Result:        result,
@@ -1496,8 +1505,4 @@ func (e *Exchange) SendHTTPRequest(ctx context.Context, ep exchange.URL, epl req
 			HTTPRecording: e.HTTPRecording,
 		}, nil
 	}, authType)
-	if err != nil && len(auth) > 0 && auth[0] {
-		return fmt.Errorf("%w %v", request.ErrAuthRequestFailed, err)
-	}
-	return err
 }

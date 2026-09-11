@@ -3,10 +3,12 @@ package mexc
 import (
 	"context"
 	"encoding/hex"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,9 +18,11 @@ import (
 	"github.com/thrasher-corp/gocryptotrader/currency"
 	"github.com/thrasher-corp/gocryptotrader/encoding/json"
 	"github.com/thrasher-corp/gocryptotrader/exchange/accounts"
+	exchange "github.com/thrasher-corp/gocryptotrader/exchanges"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/asset"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/deposit"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/order"
+	"github.com/thrasher-corp/gocryptotrader/exchanges/request"
 	testexch "github.com/thrasher-corp/gocryptotrader/internal/testing/exchange"
 )
 
@@ -350,4 +354,82 @@ func TestCreateBatchOrderPartialRejection(t *testing.T) {
 	assert.Contains(t, err.Error(), "30002", "the rejection code should be reported")
 	require.Len(t, orders, 1, "only the accepted order should be returned, not a zero-value stand-in for the rejected one")
 	assert.Equal(t, "ok1", orders[0].OrderID, "the accepted order should be present")
+}
+
+// TestAuthRequestReSignsOnRetry asserts each attempt of an authenticated request signs a fresh
+// timestamp. doRequest re-invokes the request builder on a rate-limit wait or 429; a timestamp minted
+// once before the first attempt goes stale on the retry (recvWindow exceeded) and is rejected. group
+// T defect #11a.
+func TestAuthRequestReSignsOnRetry(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	var timestamps []string
+	var calls int
+	e := newSignedTestExchange(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		timestamps = append(timestamps, r.URL.Query().Get("timestamp"))
+		calls++
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	_, err := e.GetAccountInformation(t.Context())
+	require.NoError(t, err, "the request should succeed after a retry")
+	require.Len(t, timestamps, 2, "the 429 should have triggered exactly one retry")
+	assert.NotEqual(t, timestamps[0], timestamps[1], "each attempt must sign a fresh timestamp, not reuse a stale one")
+}
+
+// TestAuthRequestErrorWrapsTransport asserts an authenticated request failure keeps the underlying
+// transport error matchable with errors.Is. Wrapping it with %v (and duplicating the wrap SendPayload
+// already applies) severed the chain. group T defect #11b.
+func TestAuthRequestErrorWrapsTransport(t *testing.T) {
+	t.Parallel()
+	e := newSignedTestExchange(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"code":-1,"msg":"boom"}`))
+	}))
+	_, err := e.GetAccountInformation(t.Context())
+	require.Error(t, err, "a 500 must surface as an error")
+	assert.ErrorIs(t, err, request.ErrBadStatus, "the transport error must remain matchable with errors.Is")
+	assert.ErrorIs(t, err, request.ErrAuthRequestFailed, "an authenticated request failure should still report as such")
+}
+
+// TestAuthRequestSignsQueryAndBody asserts the signature covers the query string plus the request
+// body. MEXC signs totalParams = query string + body; signing the query alone means the three
+// body-carrying broker callers sign something other than what they send. group T defect #11c.
+func TestAuthRequestSignsQueryAndBody(t *testing.T) {
+	t.Parallel()
+	var (
+		mu       sync.Mutex
+		gotQuery url.Values
+		gotBody  string
+	)
+	e := newSignedTestExchange(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		gotQuery = r.URL.Query()
+		gotBody = string(b)
+		mu.Unlock()
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	arg := map[string]string{"note": "hello"}
+	var result struct{}
+	err := e.SendHTTPRequest(t.Context(), exchange.RestSpot, request.Auth, http.MethodPost, "broker/sub-account/apiKey", url.Values{"symbol": {"BTCUSDT"}}, arg, &result, true)
+	require.NoError(t, err, "SendHTTPRequest must not error")
+	sig := gotQuery.Get("signature")
+	require.NotEmpty(t, sig, "the signature must be present")
+	require.NotEmpty(t, gotBody, "the request must carry a body")
+	signed := url.Values{}
+	for k, v := range gotQuery {
+		if k != "signature" {
+			signed[k] = v
+		}
+	}
+	expected, err := crypto.GetHMAC(crypto.HashSHA256, []byte(signed.Encode()+gotBody), []byte(testCredentialSecret))
+	require.NoError(t, err, "GetHMAC must not error")
+	assert.Equal(t, hex.EncodeToString(expected), sig, "the signature must cover the query string plus the request body")
 }
