@@ -268,6 +268,17 @@ type OrderDetail struct {
 	OrigQuoteOrderQty   types.Number `json:"origQuoteOrderQty"`
 }
 
+// BatchOrderResult is one entry of a batch order creation response. MEXC returns a mixed array where
+// a rejected order carries code and msg in place of the order fields; without them a rejected entry
+// decodes to a zero-value OrderDetail a caller cannot tell from a placed order. It also carries
+// newClientOrderId, the identifier the error record echoes (distinct from clientOrderId).
+type BatchOrderResult struct {
+	OrderDetail
+	NewClientOrderID string `json:"newClientOrderId"`
+	Code             int64  `json:"code"`
+	Msg              string `json:"msg"`
+}
+
 // BatchOrderCreationParam represents a batch order creation parameter
 type BatchOrderCreationParam struct {
 	OrderType        string        `json:"type"`

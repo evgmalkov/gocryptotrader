@@ -331,3 +331,23 @@ func TestUpdateOrderbookStampsVenueTime(t *testing.T) {
 	assert.Equal(t, int64(123456), ob.LastUpdateID, "LastUpdateID should be read from the venue response")
 	assert.Equal(t, int64(1736409765000), ob.LastUpdated.UnixMilli(), "LastUpdated should be the venue timestamp, not the local clock")
 }
+
+// TestCreateBatchOrderPartialRejection asserts a partially rejected batch does not report a rejected
+// entry as a placed order. MEXC returns a mixed array where a rejected order carries code+msg in
+// place of the order fields; decoding it into []*OrderDetail turned it into a zero-value order the
+// caller could not tell from a success. group T defect #12.
+func TestCreateBatchOrderPartialRejection(t *testing.T) {
+	t.Parallel()
+	e := newSignedTestExchange(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`[{"symbol":"BTCUSDT","orderId":"ok1","price":"20000","origQty":"1","type":"LIMIT","side":"BUY","status":"NEW"},{"newClientOrderId":"rej1","code":30002,"msg":"oversold"}]`))
+	}))
+	args := []BatchOrderCreationParam{
+		{Symbol: currency.NewBTCUSDT(), Side: order.Buy.String(), OrderType: "LIMIT", Quantity: 1, Price: 20000},
+		{Symbol: currency.NewBTCUSDT(), Side: order.Sell.String(), OrderType: "LIMIT", Quantity: 1, Price: 21000},
+	}
+	orders, err := e.CreateBatchOrder(t.Context(), args)
+	require.Error(t, err, "a rejected batch entry must surface as an error")
+	assert.Contains(t, err.Error(), "30002", "the rejection code should be reported")
+	require.Len(t, orders, 1, "only the accepted order should be returned, not a zero-value stand-in for the rejected one")
+	assert.Equal(t, "ok1", orders[0].OrderID, "the accepted order should be present")
+}

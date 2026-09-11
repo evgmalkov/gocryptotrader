@@ -51,6 +51,7 @@ var (
 	errAccountTypeRequired        = errors.New("account type information required")
 	errTransactionIDRequired      = errors.New("missing transaction ID")
 	errPaginationLimitIsRequired  = errors.New("limit is required")
+	errBatchOrderRejected         = errors.New("batch order rejected")
 )
 
 // GetSymbols retrieves current exchange trading rules and symbol information
@@ -1010,8 +1011,28 @@ func (e *Exchange) CreateBatchOrder(ctx context.Context, args []BatchOrderCreati
 	}
 	params := url.Values{}
 	params.Set("batchOrders", string(jsonString))
-	var resp []*OrderDetail
-	return resp, e.SendHTTPRequest(ctx, exchange.RestSpot, createBatchOrdersEPL, http.MethodPost, "batchOrders", params, nil, &resp, true)
+	// Decode into a type carrying code+msg: MEXC returns a mixed array where a rejected order carries
+	// code+msg in place of the order fields. Decoding into []*OrderDetail turned a rejected entry into
+	// a zero-value order the caller could not tell from a success.
+	var raw []BatchOrderResult
+	if err := e.SendHTTPRequest(ctx, exchange.RestSpot, createBatchOrdersEPL, http.MethodPost, "batchOrders", params, nil, &raw, true); err != nil {
+		return nil, err
+	}
+	resp := make([]*OrderDetail, 0, len(raw))
+	var rejected error
+	for i := range raw {
+		if raw[i].Code != 0 {
+			id := raw[i].NewClientOrderID
+			if id == "" {
+				id = raw[i].ClientOrderID
+			}
+			rejected = common.AppendError(rejected, fmt.Errorf("%w: order %q (code %d): %s", errBatchOrderRejected, id, raw[i].Code, raw[i].Msg))
+			continue
+		}
+		od := raw[i].OrderDetail
+		resp = append(resp, &od)
+	}
+	return resp, rejected
 }
 
 // CancelTradeOrder cancels an order
