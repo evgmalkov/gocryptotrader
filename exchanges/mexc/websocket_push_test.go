@@ -351,9 +351,7 @@ func TestWsBookTickerFeedsTickerNotOrderbook(t *testing.T) {
 		require.NoError(t, e.CurrencyPairs.StorePairs(asset.Spot, list, pairs.enabled), "StorePairs must not error")
 	}
 
-	syncOrderbookPairsLock.Lock()
-	clear(orderbookSnapshotLoadedPairs)
-	syncOrderbookPairsLock.Unlock()
+	e.resetOrderbookSnapshots()
 
 	pairs := []currency.Pair{spotTradablePair, second}
 	// Earlier tests in this package populate the shared orderbook store, so "no book exists" is not

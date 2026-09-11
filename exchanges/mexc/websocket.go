@@ -7,7 +7,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"text/template"
 	"time"
 
@@ -52,43 +51,38 @@ const (
 	wsPongMessage = "PONG"
 )
 
-// orderbookSnapshotLoadedPairs records, per symbol, whether a full orderbook snapshot has already
-// been loaded for the current websocket connection; syncOrderbookPairsLock guards every access to it.
-// The map must be reset on each (re)connect: the exchange restarts the depth stream from a fresh
-// snapshot after a reconnect, so a symbol left marked "loaded" would skip the new snapshot and apply
-// increments onto a stale book.
-var (
-	orderbookSnapshotLoadedPairs = map[string]bool{}
-	syncOrderbookPairsLock       sync.Mutex
-)
-
 // claimOrderbookSnapshot reports whether the caller should load the snapshot for symbol, atomically
 // marking it loaded so a concurrent frame for the same symbol does not load it twice. All access to
-// the shared map goes through the lock, so the depth handlers are free of the data race the earlier
-// unlocked read introduced (concurrent map read/write is a fatal error under the race detector).
-func claimOrderbookSnapshot(symbol string) bool {
-	syncOrderbookPairsLock.Lock()
-	defer syncOrderbookPairsLock.Unlock()
-	if orderbookSnapshotLoadedPairs[symbol] {
+// the per-instance map goes through the lock, so the depth handlers are free of the data race the
+// earlier unlocked read introduced (concurrent map read/write is a fatal error under the race
+// detector). The map is lazily created on first claim so a freshly constructed Exchange is usable.
+func (e *Exchange) claimOrderbookSnapshot(symbol string) bool {
+	e.syncOrderbookPairsLock.Lock()
+	defer e.syncOrderbookPairsLock.Unlock()
+	if e.orderbookSnapshotLoadedPairs[symbol] {
 		return false
 	}
-	orderbookSnapshotLoadedPairs[symbol] = true
+	if e.orderbookSnapshotLoadedPairs == nil {
+		e.orderbookSnapshotLoadedPairs = map[string]bool{}
+	}
+	e.orderbookSnapshotLoadedPairs[symbol] = true
 	return true
 }
 
 // releaseOrderbookSnapshot clears the loaded mark for symbol so the snapshot is retried, used when the
 // load that claimed it failed.
-func releaseOrderbookSnapshot(symbol string) {
-	syncOrderbookPairsLock.Lock()
-	defer syncOrderbookPairsLock.Unlock()
-	delete(orderbookSnapshotLoadedPairs, symbol)
+func (e *Exchange) releaseOrderbookSnapshot(symbol string) {
+	e.syncOrderbookPairsLock.Lock()
+	defer e.syncOrderbookPairsLock.Unlock()
+	delete(e.orderbookSnapshotLoadedPairs, symbol)
 }
 
-// resetOrderbookSnapshots forgets every loaded mark; called on connect so a reconnect reloads snapshots.
-func resetOrderbookSnapshots() {
-	syncOrderbookPairsLock.Lock()
-	defer syncOrderbookPairsLock.Unlock()
-	clear(orderbookSnapshotLoadedPairs)
+// resetOrderbookSnapshots forgets every loaded mark for this instance; called on connect so a
+// reconnect reloads snapshots without disturbing any other Exchange instance.
+func (e *Exchange) resetOrderbookSnapshots() {
+	e.syncOrderbookPairsLock.Lock()
+	defer e.syncOrderbookPairsLock.Unlock()
+	clear(e.orderbookSnapshotLoadedPairs)
 }
 
 // WsConnect initiates a websocket connection
@@ -99,7 +93,7 @@ func (e *Exchange) WsConnect(ctx context.Context, conn websocket.Connection) err
 	// A reconnect restarts the depth stream from a fresh snapshot; drop the per-connection loaded
 	// marks so every subscribed symbol reloads its snapshot instead of applying increments onto a
 	// book kept from the previous connection.
-	resetOrderbookSnapshots()
+	e.resetOrderbookSnapshots()
 	if e.Websocket.CanUseAuthenticatedEndpoints() {
 		listenKey, err := e.GenerateListenKey(ctx)
 		if err != nil {
@@ -490,7 +484,7 @@ func (e *Exchange) WsHandleData(ctx context.Context, conn websocket.Connection, 
 			}
 		}
 
-		if claimOrderbookSnapshot(result.GetSymbol()) {
+		if e.claimOrderbookSnapshot(result.GetSymbol()) {
 			if err := e.Websocket.Orderbook.LoadSnapshot(&orderbook.Book{
 				Exchange:    e.Name,
 				Asset:       asset.Spot,
@@ -499,7 +493,7 @@ func (e *Exchange) WsHandleData(ctx context.Context, conn websocket.Connection, 
 				Pair:        cp.Format(format),
 				LastUpdated: wsSendTime(result),
 			}); err != nil {
-				releaseOrderbookSnapshot(result.GetSymbol())
+				e.releaseOrderbookSnapshot(result.GetSymbol())
 				return err
 			}
 		}
@@ -624,7 +618,7 @@ func (e *Exchange) WsHandleData(ctx context.Context, conn websocket.Connection, 
 					return err
 				}
 			}
-			if claimOrderbookSnapshot(result.GetSymbol()) {
+			if e.claimOrderbookSnapshot(result.GetSymbol()) {
 				if err := e.Websocket.Orderbook.LoadSnapshot(&orderbook.Book{
 					Exchange:    e.Name,
 					Pair:        cp,
@@ -633,7 +627,7 @@ func (e *Exchange) WsHandleData(ctx context.Context, conn websocket.Connection, 
 					Asset:       asset.Spot,
 					LastUpdated: wsSendTime(result),
 				}); err != nil {
-					releaseOrderbookSnapshot(result.GetSymbol())
+					e.releaseOrderbookSnapshot(result.GetSymbol())
 					return err
 				}
 			}
