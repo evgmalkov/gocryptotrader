@@ -250,7 +250,7 @@ func TestGetOrderInfoPairAndTimestamps(t *testing.T) {
 		}))
 		detail, err := e.GetOrderInfo(t.Context(), "1", metalUSDT, asset.Spot)
 		require.NoError(t, err, "GetOrderInfo must not error")
-		assert.False(t, detail.LastUpdated.IsZero(), "LastUpdated must not be the zero time when updateTime is absent")
+		assert.False(t, detail.LastUpdated.IsZero(), "LastUpdated should not be the zero time when updateTime is absent")
 		assert.Equal(t, int64(1736409765000), detail.LastUpdated.UnixMilli(), "LastUpdated should fall back to the order time")
 	})
 }
@@ -352,7 +352,7 @@ func TestCreateBatchOrderPartialRejection(t *testing.T) {
 	orders, err := e.CreateBatchOrder(t.Context(), args)
 	require.Error(t, err, "a rejected batch entry must surface as an error")
 	assert.Contains(t, err.Error(), "30002", "the rejection code should be reported")
-	require.Len(t, orders, 1, "only the accepted order should be returned, not a zero-value stand-in for the rejected one")
+	require.Len(t, orders, 1, "only the accepted order must be returned, not a zero-value stand-in for the rejected one")
 	assert.Equal(t, "ok1", orders[0].OrderID, "the accepted order should be present")
 }
 
@@ -378,9 +378,9 @@ func TestAuthRequestReSignsOnRetry(t *testing.T) {
 		_, _ = w.Write([]byte(`{}`))
 	}))
 	_, err := e.GetAccountInformation(t.Context())
-	require.NoError(t, err, "the request should succeed after a retry")
-	require.Len(t, timestamps, 2, "the 429 should have triggered exactly one retry")
-	assert.NotEqual(t, timestamps[0], timestamps[1], "each attempt must sign a fresh timestamp, not reuse a stale one")
+	require.NoError(t, err, "the request must succeed after a retry")
+	require.Len(t, timestamps, 2, "the 429 must have triggered exactly one retry")
+	assert.NotEqual(t, timestamps[0], timestamps[1], "each attempt should sign a fresh timestamp, not reuse a stale one")
 }
 
 // TestAuthRequestErrorWrapsTransport asserts an authenticated request failure keeps the underlying
@@ -394,7 +394,7 @@ func TestAuthRequestErrorWrapsTransport(t *testing.T) {
 	}))
 	_, err := e.GetAccountInformation(t.Context())
 	require.Error(t, err, "a 500 must surface as an error")
-	assert.ErrorIs(t, err, request.ErrBadStatus, "the transport error must remain matchable with errors.Is")
+	assert.ErrorIs(t, err, request.ErrBadStatus, "the transport error should remain matchable with errors.Is")
 	assert.ErrorIs(t, err, request.ErrAuthRequestFailed, "an authenticated request failure should still report as such")
 }
 
@@ -431,7 +431,7 @@ func TestAuthRequestSignsQueryAndBody(t *testing.T) {
 	}
 	expected, err := crypto.GetHMAC(crypto.HashSHA256, []byte(signed.Encode()+gotBody), []byte(testCredentialSecret))
 	require.NoError(t, err, "GetHMAC must not error")
-	assert.Equal(t, hex.EncodeToString(expected), sig, "the signature must cover the query string plus the request body")
+	assert.Equal(t, hex.EncodeToString(expected), sig, "the signature should cover the query string plus the request body")
 }
 
 // TestExtendListenKey asserts the user data stream keepalive is a PUT to userDataStream carrying the
@@ -470,6 +470,6 @@ func TestExtendListenKey(t *testing.T) {
 		e := newSignedTestExchange(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte(`{}`))
 		}))
-		assert.Error(t, e.ExtendListenKey(t.Context(), ""), "an empty listen key must be rejected")
+		assert.Error(t, e.ExtendListenKey(t.Context(), ""), "an empty listen key should be rejected")
 	})
 }

@@ -1290,7 +1290,7 @@ func TestGetHistoricCandlesExtended(t *testing.T) {
 // size each range at 1000 candles, fill it half way, and zero-pad the remainder silently.
 func TestKlineGlobalResultLimit(t *testing.T) {
 	t.Parallel()
-	assert.Equal(t, uint64(500), e.Features.Enabled.Kline.GlobalResultLimit, "MEXC klines return at most 500 rows, so the global result limit must be 500")
+	assert.Equal(t, uint64(500), e.Features.Enabled.Kline.GlobalResultLimit, "MEXC klines return at most 500 rows, so the global result limit should be 500")
 }
 
 func TestGetServerTime(t *testing.T) {

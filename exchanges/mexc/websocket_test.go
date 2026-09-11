@@ -67,9 +67,9 @@ func TestOrderbookSnapshotPerInstance(t *testing.T) {
 	eB := new(Exchange)
 	assert.True(t, eA.claimOrderbookSnapshot(symbol), "instance A should claim and load its snapshot")
 	assert.False(t, eA.claimOrderbookSnapshot(symbol), "A's second claim for the same symbol should be denied")
-	assert.True(t, eB.claimOrderbookSnapshot(symbol), "instance B must load its own snapshot, not be blocked by A's claim")
+	assert.True(t, eB.claimOrderbookSnapshot(symbol), "instance B should load its own snapshot, not be blocked by A's claim")
 	eA.resetOrderbookSnapshots()
-	assert.False(t, eB.claimOrderbookSnapshot(symbol), "resetting A must not clear B's marks")
+	assert.False(t, eB.claimOrderbookSnapshot(symbol), "resetting A should not clear B's marks")
 }
 
 // wsTestSymbol is the only pair the mock exchange enables, so every test frame carries it.
