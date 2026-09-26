@@ -101,6 +101,12 @@ var listenKeyKeepAliveInterval = 30 * time.Minute
 // listenKeyCloseTimeout bounds the request that releases a listen key once its renewer stops
 const listenKeyCloseTimeout = 5 * time.Second
 
+// listenKeyConnCheckInterval is how often a renewer checks that its connection is still open. When a
+// later connection fails the manager closes the ones already made without closing ShutdownC, and the
+// monitor retries every few seconds, so a renewer noticing only at its next renewal would hold on to one
+// listen key per retry for up to a renewal interval.
+const listenKeyConnCheckInterval = time.Second
+
 // keepListenKeyAlive renews one connection's user data stream on a timer for as long as the connection
 // lives. Each authenticated connection mints its own listen key, so the renewer is handed that key and
 // renews it: once subscriptions span more than one connection, a single shared slot would hold only
@@ -108,25 +114,31 @@ const listenKeyCloseTimeout = 5 * time.Second
 // private updates on it. The stream closes 60 minutes after creation unless a keepalive PUT is sent;
 // the PING handler keeps the socket open but does not touch the key. When the renewer stops it closes
 // the key, since the venue caps the listen keys an account may hold and every reconnect mints a new
-// one. The renewer stops when the manager shuts down or its context is cancelled; a connection lost on
-// its own is only noticed at the next renewal tick, so its key is released up to one interval later.
+// one. The renewer stops when the manager shuts down, its context is cancelled or its own connection is
+// found closed, which is checked every listenKeyConnCheckInterval.
 func (e *Exchange) keepListenKeyAlive(ctx context.Context, conn websocket.Connection, listenKey string) {
 	e.Websocket.Wg.Add(1)
 	defer e.Websocket.Wg.Done()
 	defer e.releaseListenKey(ctx, listenKey)
 	renew := time.NewTicker(listenKeyKeepAliveInterval)
 	defer renew.Stop()
+	connCheck := time.NewTicker(listenKeyConnCheckInterval)
+	defer connCheck.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-e.Websocket.ShutdownC:
 			return
-		case <-renew.C:
+		case <-connCheck.C:
 			// The manager can close one connection without closing ShutdownC: it rolls back the
 			// connections already made when a later one fails. Stop renewing a key whose socket is gone,
 			// so a rolled-back connection does not go on burning one of the account's listen keys.
-			if c, ok := conn.(interface{ IsConnected() bool }); ok && !c.IsConnected() {
+			if connectionClosed(conn) {
+				return
+			}
+		case <-renew.C:
+			if connectionClosed(conn) {
 				return
 			}
 			if err := e.ExtendListenKey(ctx, listenKey); err != nil {
@@ -134,6 +146,12 @@ func (e *Exchange) keepListenKeyAlive(ctx context.Context, conn websocket.Connec
 			}
 		}
 	}
+}
+
+// connectionClosed reports whether a connection which reports its state is closed
+func connectionClosed(conn websocket.Connection) bool {
+	c, ok := conn.(interface{ IsConnected() bool })
+	return ok && !c.IsConnected()
 }
 
 // releaseListenKey closes a connection's listen key. The connection's context is usually done by then,

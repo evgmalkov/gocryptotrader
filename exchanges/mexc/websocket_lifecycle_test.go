@@ -20,6 +20,7 @@ import (
 	"github.com/thrasher-corp/gocryptotrader/encoding/json"
 	"github.com/thrasher-corp/gocryptotrader/exchange/accounts"
 	"github.com/thrasher-corp/gocryptotrader/exchange/websocket"
+	exchange "github.com/thrasher-corp/gocryptotrader/exchanges"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/asset"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/kline"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/request"
@@ -399,4 +400,108 @@ func TestWsConnectOutlivesALostConfirmation(t *testing.T) {
 		"spot@public.aggre.deals.v3.api.pb@100ms@ETHUSDT",
 	}, registeredChannels(ex), "every channel the venue confirmed should be registered")
 	assert.Equal(t, 1, srv.subscribed("spot@public.aggre.deals.v3.api.pb@100ms@ETHUSDT"), "the channels after the unanswered one should be requested")
+}
+
+// listenKeyLedger is a REST server minting and closing listen keys
+type listenKeyLedger struct {
+	mu                      sync.Mutex
+	minted, closed, renewed int
+	live                    map[string]bool
+	client                  *http.Client
+}
+
+func (l *listenKeyLedger) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	switch r.Method {
+	case http.MethodPost:
+		l.minted++
+		k := "KEY" + itoa(int64(l.minted))
+		l.live[k] = true
+		_, _ = w.Write([]byte(`{"listenKey":"` + k + `"}`))
+		return
+	case http.MethodDelete:
+		l.closed++
+		delete(l.live, r.URL.Query().Get("listenKey"))
+	case http.MethodPut:
+		l.renewed++
+	}
+	_, _ = w.Write([]byte(`{}`))
+}
+
+func (l *listenKeyLedger) counts() (minted, closed, live int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.minted, l.closed, len(l.live)
+}
+
+// withListenKeyREST points the exchange's REST endpoints at a listen key ledger and enables the
+// authenticated websocket
+func withListenKeyREST(t *testing.T, ex *Exchange) *listenKeyLedger {
+	t.Helper()
+	l := &listenKeyLedger{live: map[string]bool{}}
+	srv := httptest.NewServer(l)
+	t.Cleanup(srv.Close)
+	ex.SetCredentials(&accounts.Credentials{Key: testCredentialKey, Secret: testCredentialSecret})
+	ex.GetBase().SkipAuthCheck = true
+	require.NoError(t, ex.Requester.DisableRateLimiter(), "DisableRateLimiter must not error")
+	l.client = srv.Client()
+	require.NoError(t, ex.SetHTTPClient(l.client), "SetHTTPClient must not error")
+	require.NoError(t, ex.API.Endpoints.SetRunningURL(exchange.RestSpot.String(), srv.URL), "SetRunningURL must not error")
+	ex.Websocket.SetCanUseAuthenticatedEndpoints(true)
+	return l
+}
+
+// TestKeepListenKeyAliveReleasesPromptlyWhenItsConnectionCloses releases a listen key within a few seconds
+// of its connection closing, not at the next renewal half an hour later.
+func TestKeepListenKeyAliveReleasesPromptlyWhenItsConnectionCloses(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	var closed []string
+	ex := newSignedTestExchange(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			mu.Lock()
+			closed = append(closed, r.URL.Query().Get("listenKey"))
+			mu.Unlock()
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	conn := &listenKeyTestConn{}
+	done := make(chan struct{})
+	go func() {
+		ex.keepListenKeyAlive(context.Background(), conn, "KEY_A")
+		close(done)
+	}()
+	conn.closed.Store(true)
+	select {
+	case <-done:
+	case <-time.After(3 * listenKeyConnCheckInterval):
+		require.Fail(t, "the renewer must stop soon after its connection closes")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"KEY_A"}, closed, "the renewer should close its listen key")
+}
+
+// TestWsRollbackDoesNotHoldListenKeys keeps a second connection of an authenticated websocket failing, so
+// every monitor cycle opens the first connection with a fresh listen key and then rolls it back. Once the
+// venue accepts both, the account must hold only the two keys in use. Renewers that noticed a rolled-back
+// connection only at their next renewal kept one key per failed cycle for half an hour, and the venue caps
+// the keys an account may hold.
+func TestWsRollbackDoesNotHoldListenKeys(t *testing.T) {
+	t.Parallel()
+	srv := newWsMockServer(t)
+	var refusing atomic.Bool
+	refusing.Store(true)
+	srv.refuse = func(open int32) bool { return refusing.Load() && open >= 1 }
+	ex := newWsLifecycleExchange(t, srv.wsURL(), wsLifecycleDepthSubs(), nil)
+	ex.Websocket.MaxSubscriptionsPerConnection = 1
+	ledger := withListenKeyREST(t, ex)
+
+	require.Error(t, ex.Websocket.Connect(context.Background()), "Connect must fail while the second connection is refused")
+	require.Eventually(t, func() bool { minted, _, _ := ledger.counts(); return minted >= 8 }, 5*time.Second, 10*time.Millisecond, "the monitor must keep retrying")
+	refusing.Store(false)
+	require.Eventually(t, ex.Websocket.IsConnected, 5*time.Second, 10*time.Millisecond, "the websocket must connect once both connections are accepted")
+	require.EqualValues(t, 2, srv.open.Load(), "both connections must be open")
+	assert.Eventually(t, func() bool { _, _, live := ledger.counts(); return live == 2 }, 3*listenKeyConnCheckInterval, 10*time.Millisecond, "only the two keys in use should be held")
 }
