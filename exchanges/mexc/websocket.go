@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"text/template"
 	"time"
 
@@ -68,10 +70,12 @@ func (e *Exchange) WsConnect(ctx context.Context, conn websocket.Connection) err
 		}
 		conn.SetURL(conn.GetURL() + "?listenKey=" + listenKey)
 	}
+	idle := &idleReadDialer{timeout: wsReadIdleTimeout}
 	if err := conn.Dial(ctx, &gws.Dialer{
 		EnableCompression: true,
 		ReadBufferSize:    8192,
 		WriteBufferSize:   8192,
+		NetDialContext:    idle.DialContext,
 	}, http.Header{}, nil); err != nil {
 		if listenKey != "" {
 			// No renewer owns the key until the connection is up, so release it here: the monitor retries a
@@ -80,10 +84,12 @@ func (e *Exchange) WsConnect(ctx context.Context, conn websocket.Connection) err
 		}
 		return err
 	}
+	// The handshake is over, so reads can now be bounded without cutting it short
+	idle.arm()
 	conn.SetupPingHandler(request.Unset, websocket.PingHandler{
 		MessageType: gws.TextMessage,
 		Message:     []byte(`{"method": "PING"}`),
-		Delay:       time.Second * 20,
+		Delay:       wsPingInterval,
 	})
 	if listenKey != "" {
 		// The stream closes 60 minutes after creation unless a keepalive is sent; renew this
@@ -92,6 +98,51 @@ func (e *Exchange) WsConnect(ctx context.Context, conn websocket.Connection) err
 		go e.keepListenKeyAlive(ctx, conn, listenKey)
 	}
 	return nil
+}
+
+// wsPingInterval is how often each connection sends PING; the venue answers every one with PONG
+const wsPingInterval = 20 * time.Second
+
+// wsReadIdleTimeout closes a connection which has received nothing for this long, not even the PONG to
+// its last few PINGs, so that it is reported lost and reconnected. The manager's traffic monitor watches
+// the traffic of all connections together: once subscriptions span more than one connection, a
+// connection which stops receiving goes unnoticed for as long as another one still receives. A variable
+// rather than a constant so tests can shorten it.
+var wsReadIdleTimeout = 3 * wsPingInterval
+
+// idleReadDialer dials connections whose reads fail once nothing has arrived for timeout. The bound is
+// only applied after arm, so the websocket handshake keeps the dialer's own timeout.
+type idleReadDialer struct {
+	timeout time.Duration
+	armed   atomic.Bool
+}
+
+// DialContext dials a TCP connection whose reads are bounded once the dialer is armed
+func (d *idleReadDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	var nd net.Dialer
+	c, err := nd.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	return &idleReadConn{Conn: c, dialer: d}, nil
+}
+
+func (d *idleReadDialer) arm() { d.armed.Store(true) }
+
+// idleReadConn is a net.Conn whose every read, once armed, must complete within the dialer's timeout
+type idleReadConn struct {
+	net.Conn
+	dialer *idleReadDialer
+}
+
+// Read reads from the connection, failing with a timeout when nothing arrives in time
+func (c *idleReadConn) Read(b []byte) (int, error) {
+	if c.dialer.armed.Load() && c.dialer.timeout > 0 {
+		if err := c.Conn.SetReadDeadline(time.Now().Add(c.dialer.timeout)); err != nil {
+			return 0, err
+		}
+	}
+	return c.Conn.Read(b)
 }
 
 // listenKeyKeepAliveInterval renews the user data stream well within its 60-minute expiry. A variable

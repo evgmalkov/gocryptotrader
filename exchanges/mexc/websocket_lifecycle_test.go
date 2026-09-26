@@ -505,3 +505,46 @@ func TestWsRollbackDoesNotHoldListenKeys(t *testing.T) {
 	require.EqualValues(t, 2, srv.open.Load(), "both connections must be open")
 	assert.Eventually(t, func() bool { _, _, live := ledger.counts(); return live == 2 }, 3*listenKeyConnCheckInterval, 10*time.Millisecond, "only the two keys in use should be held")
 }
+
+// TestWsReadIdleTimeoutSparesAQuietConnection keeps the idle bound clear of the PING cycle: a healthy
+// connection subscribed to quiet channels still receives a PONG every wsPingInterval.
+func TestWsReadIdleTimeoutSparesAQuietConnection(t *testing.T) {
+	t.Parallel()
+	assert.GreaterOrEqual(t, wsReadIdleTimeout, 2*wsPingInterval, "the idle bound should outlast at least two unanswered PINGs")
+}
+
+// TestWsSilentConnectionIsReplaced spreads two subscriptions over two connections and lets one of them go
+// silent while the other keeps receiving. The silent connection must be reported lost and the websocket
+// reconnected. The manager's traffic monitor watches all connections together, so without a bound on
+// each connection's reads the silent one went unnoticed while the other received.
+// It shortens wsReadIdleTimeout, so it does not run in parallel.
+func TestWsSilentConnectionIsReplaced(t *testing.T) {
+	prev := wsReadIdleTimeout
+	wsReadIdleTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { wsReadIdleTimeout = prev })
+
+	for _, tc := range []struct {
+		name   string
+		silent bool
+	}{
+		{"one connection silent", true},
+		{"both connections receiving", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newWsMockServer(t)
+			srv.pushEvery = 50 * time.Millisecond
+			srv.silence[wsLifecycleETHDepth] = tc.silent
+			ex := newWsLifecycleExchange(t, srv.wsURL(), wsLifecycleDepthSubs(), nil)
+			ex.Websocket.MaxSubscriptionsPerConnection = 1
+			require.NoError(t, ex.Websocket.Connect(context.Background()), "Connect must not error")
+			require.EqualValues(t, 2, srv.attempts.Load(), "each subscription must get its own connection")
+			if tc.silent {
+				assert.Eventually(t, func() bool { return srv.attempts.Load() > 2 }, 3*time.Second, 10*time.Millisecond, "the silent connection should be dropped and the websocket reconnected")
+				return
+			}
+			time.Sleep(10 * wsReadIdleTimeout)
+			assert.EqualValues(t, 2, srv.attempts.Load(), "connections which keep receiving should not be dropped")
+			assert.True(t, ex.Websocket.IsConnected(), "the websocket should stay connected")
+		})
+	}
+}
