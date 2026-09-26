@@ -276,6 +276,8 @@ func subscriptionAccepted(method, qualifiedChannel, msg string) bool {
 
 func (e *Exchange) handleSubscription(ctx context.Context, conn websocket.Connection, method string, subs subscription.List) error {
 	var confirmed, rejected subscription.List
+	var errs error
+	lostInARow := 0
 	for s := range subs {
 		id := e.MessageSequence()
 		data, err := conn.SendMessageReturnResponse(ctx, request.UnAuth, id, &WsSubscriptionPayload{
@@ -284,11 +286,23 @@ func (e *Exchange) handleSubscription(ctx context.Context, conn websocket.Connec
 			Params: []string{subs[s].QualifiedChannel},
 		})
 		if err != nil {
-			return err
+			errs = common.AppendError(errs, err)
+			// The channels confirmed so far are live whatever happens next, so they are still registered
+			// below. A single lost confirmation leaves the connection usable and the remaining channels
+			// are still requested; any other failure, or a second confirmation lost in a row, means the
+			// connection itself is gone.
+			if lostInARow++; errors.Is(err, websocket.ErrSignatureTimeout) && lostInARow < 2 {
+				rejected = append(rejected, subs[s])
+				continue
+			}
+			rejected = append(rejected, subs[s:]...)
+			break
 		}
+		lostInARow = 0
 		var resp *WsSubscriptionResponse
 		if err := json.Unmarshal(data, &resp); err != nil {
-			return err
+			errs = common.AppendError(errs, err)
+			rejected = append(rejected, subs[s])
 		} else if resp.Code != 0 || !subscriptionAccepted(method, subs[s].QualifiedChannel, resp.Message) {
 			rejected = append(rejected, subs[s])
 		} else {
@@ -300,7 +314,11 @@ func (e *Exchange) handleSubscription(ctx context.Context, conn websocket.Connec
 		// registered because it is still live. The previous code added every confirmed channel via
 		// AddSuccessfulSubscriptions, so an accepted unsubscribe (MEXC replies code 0 echoing the
 		// channel — measured live) re-registered the channel it had just cancelled.
-		return e.Websocket.RemoveSubscriptions(conn, confirmed...)
+		err := e.Websocket.RemoveSubscriptions(conn, confirmed...)
+		if len(rejected) > 0 {
+			err = common.AppendError(err, fmt.Errorf("%w: %s", websocket.ErrSubscriptionsNotRemoved, rejected))
+		}
+		return common.AppendError(err, errs)
 	}
 	// A rejected subscription was never stored, so there is nothing to remove: register the confirmed
 	// ones and name the rejected ones in the error.
@@ -308,7 +326,7 @@ func (e *Exchange) handleSubscription(ctx context.Context, conn websocket.Connec
 	if len(rejected) > 0 {
 		err = common.AppendError(err, fmt.Errorf("%w: %s", websocket.ErrSubscriptionFailure, rejected))
 	}
-	return err
+	return common.AppendError(err, errs)
 }
 
 // wsUpdateSpotTicker merges a partial spot ticker update into the cached ticker and publishes it.

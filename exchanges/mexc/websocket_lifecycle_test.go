@@ -2,6 +2,7 @@ package mexc
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -15,9 +16,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/thrasher-corp/gocryptotrader/config"
+	"github.com/thrasher-corp/gocryptotrader/currency"
 	"github.com/thrasher-corp/gocryptotrader/encoding/json"
 	"github.com/thrasher-corp/gocryptotrader/exchange/accounts"
+	"github.com/thrasher-corp/gocryptotrader/exchange/websocket"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/asset"
+	"github.com/thrasher-corp/gocryptotrader/exchanges/kline"
+	"github.com/thrasher-corp/gocryptotrader/exchanges/request"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/sharedtestvalues"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/subscription"
 	testutils "github.com/thrasher-corp/gocryptotrader/internal/testing/utils"
@@ -285,4 +290,113 @@ func TestWsInitialConnectFailureIsRetried(t *testing.T) {
 	assert.LessOrEqual(t, int64(attempts), int64(elapsed/wsLifecycleMonitorDelay)+2, "retries should be paced by the monitor delay")
 	time.Sleep(5 * wsLifecycleMonitorDelay)
 	assert.Equal(t, attempts, srv.attempts.Load(), "a connected websocket should not dial again")
+}
+
+// lossySubscriptionConn confirms every subscription request except those whose channel it is told to
+// fail, for which it returns the configured error. It records the channels it was asked for.
+type lossySubscriptionConn struct {
+	websocket.Connection
+	fail      map[string]error
+	requested []string
+}
+
+func (c *lossySubscriptionConn) SendMessageReturnResponse(_ context.Context, _ request.EndpointLimit, _, req any) ([]byte, error) {
+	p, ok := req.(*WsSubscriptionPayload)
+	if !ok || len(p.Params) != 1 {
+		return nil, errors.New("unexpected subscription payload")
+	}
+	c.requested = append(c.requested, p.Params[0])
+	if err := c.fail[p.Params[0]]; err != nil {
+		return nil, err
+	}
+	return []byte(`{"id":` + itoa(p.ID) + `,"code":0,"msg":"` + p.Params[0] + `"}`), nil
+}
+
+func lossyTestSubs() subscription.List {
+	subs := make(subscription.List, 4)
+	for i, base := range []currency.Code{currency.BTC, currency.ETH, currency.SOL, currency.XRP} {
+		p := currency.NewPair(base, currency.USDT)
+		subs[i] = &subscription.Subscription{Channel: channelLimitDepthV3, Asset: asset.Spot, Pairs: currency.Pairs{p}, Levels: 5, QualifiedChannel: "spot@public.limit.depth.v3.api.pb@" + base.String() + "USDT@5"}
+	}
+	return subs
+}
+
+func registeredChannels(ex *Exchange) []string {
+	var got []string
+	for _, s := range ex.Websocket.GetSubscriptions() {
+		got = append(got, s.QualifiedChannel)
+	}
+	return got
+}
+
+// TestHandleSubscriptionOutlivesALostConfirmation keeps what the venue confirmed when a later confirmation
+// is lost, and still requests the channels after it. Returning on the first lost confirmation left every
+// channel confirmed before it live but unregistered, and never requested the ones after it, while the
+// connection stayed up: those channels were missing until the next reconnect, which on a busy connection
+// is the venue's daily disconnect.
+func TestHandleSubscriptionOutlivesALostConfirmation(t *testing.T) {
+	t.Parallel()
+	subs := lossyTestSubs()
+	ex := newSignedTestExchange(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	conn := &lossySubscriptionConn{fail: map[string]error{subs[1].QualifiedChannel: websocket.ErrSignatureTimeout}}
+
+	err := ex.handleSubscription(t.Context(), conn, "SUBSCRIPTION", subs)
+	require.ErrorIs(t, err, websocket.ErrSubscriptionFailure, "the unconfirmed channel must be reported")
+	require.ErrorIs(t, err, websocket.ErrSignatureTimeout, "the cause must be kept")
+	assert.ErrorContains(t, err, "ETH/USDT", "the error should name the unconfirmed channel")
+	assert.Len(t, conn.requested, 4, "the channels after the lost confirmation should still be requested")
+	assert.ElementsMatch(t, []string{subs[0].QualifiedChannel, subs[2].QualifiedChannel, subs[3].QualifiedChannel}, registeredChannels(ex), "every confirmed channel should be registered")
+}
+
+// TestHandleSubscriptionStopsOnADeadConnection stops requesting once the connection is shown to be gone,
+// by a second confirmation lost in a row or by a failed send, and still registers what was confirmed.
+func TestHandleSubscriptionStopsOnADeadConnection(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		fail func(subs subscription.List) map[string]error
+		sent int
+	}{
+		{"two lost in a row", func(subs subscription.List) map[string]error {
+			return map[string]error{subs[1].QualifiedChannel: websocket.ErrSignatureTimeout, subs[2].QualifiedChannel: websocket.ErrSignatureTimeout}
+		}, 3},
+		{"send failure", func(subs subscription.List) map[string]error {
+			return map[string]error{subs[1].QualifiedChannel: websocket.ErrNotConnected}
+		}, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			subs := lossyTestSubs()
+			ex := newSignedTestExchange(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+			conn := &lossySubscriptionConn{fail: tc.fail(subs)}
+			err := ex.handleSubscription(t.Context(), conn, "SUBSCRIPTION", subs)
+			require.ErrorIs(t, err, websocket.ErrSubscriptionFailure, "the failure must be reported")
+			assert.Len(t, conn.requested, tc.sent, "nothing should be requested once the connection is gone")
+			assert.Equal(t, []string{subs[0].QualifiedChannel}, registeredChannels(ex), "the channel confirmed before the failure should be registered")
+			assert.ErrorContains(t, err, "XRP/USDT", "the channels never requested should be named in the error")
+		})
+	}
+}
+
+// TestWsConnectOutlivesALostConfirmation drives the same loss through Connect against a venue that never
+// answers one subscription: the websocket must come up with every other channel registered.
+func TestWsConnectOutlivesALostConfirmation(t *testing.T) {
+	t.Parallel()
+	srv := newWsMockServer(t)
+	srv.drop[wsLifecycleETHDepth] = true
+	subs := subscription.List{
+		{Enabled: true, Asset: asset.Spot, Channel: subscription.OrderbookChannel, Levels: 5},
+		{Enabled: true, Asset: asset.Spot, Channel: subscription.AllTradesChannel, Interval: kline.HundredMilliseconds},
+	}
+	ex := newWsLifecycleExchange(t, srv.wsURL(), subs, nil)
+
+	err := ex.Websocket.Connect(context.Background())
+	require.ErrorIs(t, err, websocket.ErrSubscriptionFailure, "the unanswered subscription must be reported")
+	require.True(t, ex.Websocket.IsConnected(), "the connection must stay up")
+	assert.ElementsMatch(t, []string{
+		wsLifecycleBTCDepth,
+		"spot@public.aggre.deals.v3.api.pb@100ms@BTCUSDT",
+		"spot@public.aggre.deals.v3.api.pb@100ms@ETHUSDT",
+	}, registeredChannels(ex), "every channel the venue confirmed should be registered")
+	assert.Equal(t, 1, srv.subscribed("spot@public.aggre.deals.v3.api.pb@100ms@ETHUSDT"), "the channels after the unanswered one should be requested")
 }
