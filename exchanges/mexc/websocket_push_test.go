@@ -264,6 +264,69 @@ func TestDepthSubscriptionFailureInvalidatesBook(t *testing.T) {
 	})
 }
 
+// TestBookTickerSubscriptionFailureClearsBidAsk asserts the cached best bid/offer is dropped once the
+// bookTicker channel is rejected or unsubscribed. miniTicker keeps re-stamping the same ticker, so the
+// frozen bid/ask used to look current for as long as miniTicker streamed. A rejected miniTicker channel
+// leaves the bid/ask alone.
+func TestBookTickerSubscriptionFailureClearsBidAsk(t *testing.T) {
+	const bookChannel = "spot@" + channelBookTiker + "@100ms@BTCUSDT"
+	const miniChannel = "spot@" + channelMiniTickerV3 + "@BTCUSDT@" + miniTickerTimezone
+	refused := func(ch string) string {
+		return `{"id":0,"code":0,"msg":"Not Subscribed successfully! [` + ch + `].  Reason： Blocked! "}`
+	}
+	newSub := func(channel, qualified string) *subscription.Subscription {
+		return &subscription.Subscription{Channel: channel, Asset: asset.Spot, Pairs: currency.Pairs{spotTradablePair}, QualifiedChannel: qualified}
+	}
+	loadTicker := func(t *testing.T) {
+		t.Helper()
+		drainData(t)
+		require.NoError(t, e.WsHandleData(t.Context(), nil, wsPushFrame(t, bookChannel, 1736411838000,
+			&mexc_proto_types.PublicAggreBookTickerV3Api{BidPrice: "100", BidQuantity: "1", AskPrice: "101", AskQuantity: "2"})), "the bookTicker frame must load")
+		require.NoError(t, e.WsHandleData(t.Context(), nil, wsPushFrame(t, miniChannel, 1736411838500,
+			&mexc_proto_types.PublicMiniTickerV3Api{Symbol: "BTCUSDT", Price: "97"})), "the miniTicker frame must load")
+	}
+	getTicker := func(t *testing.T) *ticker.Price {
+		t.Helper()
+		tick, err := ticker.GetTicker(e.Name, spotTradablePair, asset.Spot)
+		require.NoError(t, err, "the ticker must be retrievable")
+		return tick
+	}
+
+	t.Run("rejected bookTicker", func(t *testing.T) {
+		loadTicker(t)
+		conn := &subscriptionTestConn{replies: map[string]string{bookChannel: refused(bookChannel)}}
+		err := e.handleSubscription(t.Context(), conn, "SUBSCRIPTION", subscription.List{newSub(subscription.TickerChannel, bookChannel)})
+		require.ErrorIs(t, err, websocket.ErrSubscriptionFailure, "the rejection must be reported")
+		tick := getTicker(t)
+		assert.Zero(t, tick.Bid, "the bid should be dropped")
+		assert.Zero(t, tick.BidSize, "the bid size should be dropped")
+		assert.Zero(t, tick.Ask, "the ask should be dropped")
+		assert.Zero(t, tick.AskSize, "the ask size should be dropped")
+		assert.Equal(t, 97.0, tick.Last, "the miniTicker fields should be kept")
+	})
+
+	t.Run("unsubscribed bookTicker", func(t *testing.T) {
+		conn := &subscriptionTestConn{replies: map[string]string{bookChannel: `{"id":0,"code":0,"msg":"` + bookChannel + `"}`}}
+		sub := newSub(subscription.TickerChannel, bookChannel)
+		require.NoError(t, e.handleSubscription(t.Context(), conn, "SUBSCRIPTION", subscription.List{sub}), "the subscription must be accepted")
+		loadTicker(t)
+		require.NoError(t, e.handleSubscription(t.Context(), conn, "UNSUBSCRIPTION", subscription.List{sub}), "the unsubscription must be accepted")
+		tick := getTicker(t)
+		assert.Zero(t, tick.Bid, "the bid should be dropped")
+		assert.Zero(t, tick.Ask, "the ask should be dropped")
+	})
+
+	t.Run("rejected miniTicker", func(t *testing.T) {
+		loadTicker(t)
+		conn := &subscriptionTestConn{replies: map[string]string{miniChannel: refused(miniChannel)}}
+		err := e.handleSubscription(t.Context(), conn, "SUBSCRIPTION", subscription.List{newSub(channelMiniTickerV3, miniChannel)})
+		require.ErrorIs(t, err, websocket.ErrSubscriptionFailure, "the rejection must be reported")
+		tick := getTicker(t)
+		assert.Equal(t, 100.0, tick.Bid, "a rejected channel other than bookTicker should leave the bid")
+		assert.Equal(t, 101.0, tick.Ask, "a rejected channel other than bookTicker should leave the ask")
+	})
+}
+
 // TestWsHandleBookTickerBatch asserts a batched book ticker frame merges each item onto the cached
 // ticker rather than replacing it, so it does not blank the fields the miniTicker channel maintains.
 func TestWsHandleBookTickerBatch(t *testing.T) {

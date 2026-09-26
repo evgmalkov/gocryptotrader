@@ -387,15 +387,49 @@ func (e *Exchange) handleSubscription(ctx context.Context, conn websocket.Connec
 		if len(rejected) > 0 {
 			err = common.AppendError(err, fmt.Errorf("%w: %s", websocket.ErrSubscriptionsNotRemoved, rejected))
 		}
-		return common.AppendError(common.AppendError(err, errs), e.invalidateDepthBooks(confirmed))
+		return common.AppendError(common.AppendError(err, errs), e.dropStoppedMarketData(confirmed))
 	}
 	// A rejected subscription was never stored, so there is nothing to remove: register the confirmed
 	// ones and name the rejected ones in the error.
-	err := common.AppendError(e.Websocket.AddSuccessfulSubscriptions(conn, confirmed...), e.invalidateDepthBooks(rejected))
+	err := common.AppendError(e.Websocket.AddSuccessfulSubscriptions(conn, confirmed...), e.dropStoppedMarketData(rejected))
 	if len(rejected) > 0 {
 		err = common.AppendError(err, fmt.Errorf("%w: %s", websocket.ErrSubscriptionFailure, rejected))
 	}
 	return common.AppendError(err, errs)
+}
+
+// dropStoppedMarketData withdraws the market data of channels that are not, or no longer, streaming: a
+// rejected subscription or a confirmed unsubscription.
+func (e *Exchange) dropStoppedMarketData(subs subscription.List) error {
+	return common.AppendError(e.invalidateDepthBooks(subs), e.clearBestBidOffer(subs))
+}
+
+// clearBestBidOffer drops the best bid/offer from the cached ticker of every pair whose bookTicker channel
+// is among subs. The miniTicker channel keeps stamping the same ticker with its own send time, so a bid/ask
+// that bookTicker no longer updates would otherwise look current for as long as miniTicker streams, and the
+// sync manager, which sees those ticker updates, never falls back to REST. Zero is how the ticker reads
+// before the first bookTicker frame, so this returns the pair to that state.
+func (e *Exchange) clearBestBidOffer(subs subscription.List) error {
+	var errs error
+	for _, s := range subs {
+		if channelName(s) != channelBookTiker {
+			continue
+		}
+		for _, p := range s.Pairs {
+			e.wsTickerMu.Lock()
+			tick, err := e.GetCachedTicker(p, s.Asset)
+			switch {
+			case errors.Is(err, ticker.ErrTickerNotFound):
+				err = nil
+			case err == nil:
+				tick.Bid, tick.BidSize, tick.Ask, tick.AskSize = 0, 0, 0, 0
+				err = ticker.ProcessTicker(tick)
+			}
+			e.wsTickerMu.Unlock()
+			errs = common.AppendError(errs, err)
+		}
+	}
+	return errs
 }
 
 // invalidateDepthBooks invalidates the book of every pair whose depth channel is among subs. It is called
