@@ -387,15 +387,35 @@ func (e *Exchange) handleSubscription(ctx context.Context, conn websocket.Connec
 		if len(rejected) > 0 {
 			err = common.AppendError(err, fmt.Errorf("%w: %s", websocket.ErrSubscriptionsNotRemoved, rejected))
 		}
-		return common.AppendError(err, errs)
+		return common.AppendError(common.AppendError(err, errs), e.invalidateDepthBooks(confirmed))
 	}
 	// A rejected subscription was never stored, so there is nothing to remove: register the confirmed
 	// ones and name the rejected ones in the error.
-	err := e.Websocket.AddSuccessfulSubscriptions(conn, confirmed...)
+	err := common.AppendError(e.Websocket.AddSuccessfulSubscriptions(conn, confirmed...), e.invalidateDepthBooks(rejected))
 	if len(rejected) > 0 {
 		err = common.AppendError(err, fmt.Errorf("%w: %s", websocket.ErrSubscriptionFailure, rejected))
 	}
 	return common.AppendError(err, errs)
+}
+
+// invalidateDepthBooks invalidates the book of every pair whose depth channel is among subs. It is called
+// for depth channels that are not streaming (a rejected subscription) or no longer streaming (a confirmed
+// unsubscription): nothing will replace the last snapshot, and while the websocket stays connected the
+// sync manager does not fall back to REST for the book, so it would otherwise be served as current with
+// no bound on its age. A pair that never had a book has nothing to invalidate.
+func (e *Exchange) invalidateDepthBooks(subs subscription.List) error {
+	var errs error
+	for _, s := range subs {
+		if channelName(s) != channelLimitDepthV3 {
+			continue
+		}
+		for _, p := range s.Pairs {
+			if err := e.Websocket.Orderbook.InvalidateOrderbook(p, s.Asset); err != nil && !errors.Is(err, orderbook.ErrDepthNotFound) {
+				errs = common.AppendError(errs, err)
+			}
+		}
+	}
+	return errs
 }
 
 // wsUpdateSpotTicker merges a partial spot ticker update into the cached ticker and publishes it.

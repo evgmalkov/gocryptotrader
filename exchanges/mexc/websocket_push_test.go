@@ -17,6 +17,7 @@ import (
 	"github.com/thrasher-corp/gocryptotrader/exchanges/mexc/mexc_proto_types"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/order"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/orderbook"
+	"github.com/thrasher-corp/gocryptotrader/exchanges/subscription"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/ticker"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/trade"
 	testexch "github.com/thrasher-corp/gocryptotrader/internal/testing/exchange"
@@ -206,6 +207,61 @@ func TestWsHandleLimitDepthCarriesVersion(t *testing.T) {
 	require.NoError(t, err, "the snapshot must be retrievable")
 	assert.Equal(t, int64(82278497395), book.LastUpdateID, "the book should carry the frame's version as its update id")
 	assert.Error(t, e.WsHandleData(t.Context(), nil, frame("v1")), "an unreadable version should be reported")
+}
+
+// TestDepthSubscriptionFailureInvalidatesBook asserts a pair's book is invalidated once its depth channel is
+// rejected or unsubscribed. Nothing replaces that snapshot afterwards, and while the websocket stays
+// connected the sync manager does not fall back to REST for the book, so it used to be served as current
+// indefinitely. A rejected channel other than depth leaves the book alone.
+func TestDepthSubscriptionFailureInvalidatesBook(t *testing.T) {
+	const depthChannel = "spot@" + channelLimitDepthV3 + "@BTCUSDT@5"
+	const tickerChannel = "spot@" + channelBookTiker + "@100ms@BTCUSDT"
+	accepted := func(ch string) string { return `{"id":0,"code":0,"msg":"` + ch + `"}` }
+	refused := func(ch string) string {
+		return `{"id":0,"code":0,"msg":"Not Subscribed successfully! [` + ch + `].  Reason： Blocked! "}`
+	}
+	newSub := func(channel, qualified string) *subscription.Subscription {
+		return &subscription.Subscription{Channel: channel, Asset: asset.Spot, Pairs: currency.Pairs{spotTradablePair}, Levels: 5, QualifiedChannel: qualified}
+	}
+	loadBook := func(t *testing.T) {
+		t.Helper()
+		drainData(t)
+		raw := wsPushFrame(t, depthChannel, 1736411838000, &mexc_proto_types.PublicLimitDepthsV3Api{
+			Asks: []*mexc_proto_types.PublicLimitDepthV3ApiItem{{Price: "101", Quantity: "1"}},
+			Bids: []*mexc_proto_types.PublicLimitDepthV3ApiItem{{Price: "100", Quantity: "1"}},
+		})
+		require.NoError(t, e.WsHandleData(t.Context(), nil, raw), "a valid frame must load")
+		_, err := orderbook.Get(e.Name, spotTradablePair, asset.Spot)
+		require.NoError(t, err, "the book must be valid before the subscription changes")
+	}
+
+	t.Run("rejected depth", func(t *testing.T) {
+		loadBook(t)
+		conn := &subscriptionTestConn{replies: map[string]string{depthChannel: refused(depthChannel)}}
+		err := e.handleSubscription(t.Context(), conn, "SUBSCRIPTION", subscription.List{newSub(subscription.OrderbookChannel, depthChannel)})
+		require.ErrorIs(t, err, websocket.ErrSubscriptionFailure, "the rejection must be reported")
+		_, err = orderbook.Get(e.Name, spotTradablePair, asset.Spot)
+		assert.ErrorIs(t, err, orderbook.ErrOrderbookInvalid, "a book whose depth subscription was rejected should not be served as current")
+	})
+
+	t.Run("unsubscribed depth", func(t *testing.T) {
+		conn := &subscriptionTestConn{replies: map[string]string{depthChannel: accepted(depthChannel)}}
+		sub := newSub(subscription.OrderbookChannel, depthChannel)
+		require.NoError(t, e.handleSubscription(t.Context(), conn, "SUBSCRIPTION", subscription.List{sub}), "the subscription must be accepted")
+		loadBook(t)
+		require.NoError(t, e.handleSubscription(t.Context(), conn, "UNSUBSCRIPTION", subscription.List{sub}), "the unsubscription must be accepted")
+		_, err := orderbook.Get(e.Name, spotTradablePair, asset.Spot)
+		assert.ErrorIs(t, err, orderbook.ErrOrderbookInvalid, "a book whose depth channel was cancelled should not be served as current")
+	})
+
+	t.Run("rejected ticker", func(t *testing.T) {
+		loadBook(t)
+		conn := &subscriptionTestConn{replies: map[string]string{tickerChannel: refused(tickerChannel)}}
+		err := e.handleSubscription(t.Context(), conn, "SUBSCRIPTION", subscription.List{newSub(subscription.TickerChannel, tickerChannel)})
+		require.ErrorIs(t, err, websocket.ErrSubscriptionFailure, "the rejection must be reported")
+		_, err = orderbook.Get(e.Name, spotTradablePair, asset.Spot)
+		assert.NoError(t, err, "a rejected channel other than depth should leave the book valid")
+	})
 }
 
 // TestWsHandleBookTickerBatch asserts a batched book ticker frame merges each item onto the cached
