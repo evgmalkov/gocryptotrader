@@ -155,6 +155,59 @@ func TestWsHandleLimitDepthUsesExchangeTime(t *testing.T) {
 	assert.Equal(t, time.UnixMilli(sendTime), book.LastUpdated, "the book should be stamped with the exchange send time, not time.Now()")
 }
 
+// TestWsHandleLimitDepthRejectsMalformedSnapshot asserts a depth frame that fails orderbook validation is
+// reported and invalidates the book: the frame replaces the whole book, so keeping the previous snapshot
+// would serve it as current. The frame used to be loaded without validation and published as valid.
+func TestWsHandleLimitDepthRejectsMalformedSnapshot(t *testing.T) {
+	require.True(t, e.ValidateOrderbook, "orderbook validation must be enabled for the test exchange")
+	good := &mexc_proto_types.PublicLimitDepthsV3Api{
+		Asks: []*mexc_proto_types.PublicLimitDepthV3ApiItem{{Price: "101", Quantity: "1"}, {Price: "102", Quantity: "1"}},
+		Bids: []*mexc_proto_types.PublicLimitDepthV3ApiItem{{Price: "100", Quantity: "1"}, {Price: "99", Quantity: "1"}},
+	}
+	for _, tc := range []struct {
+		name string
+		bids []*mexc_proto_types.PublicLimitDepthV3ApiItem
+	}{
+		{"unsorted bids", []*mexc_proto_types.PublicLimitDepthV3ApiItem{{Price: "99", Quantity: "1"}, {Price: "100", Quantity: "1"}}},
+		{"zero price", []*mexc_proto_types.PublicLimitDepthV3ApiItem{{Price: "0", Quantity: "1"}}},
+		{"zero quantity", []*mexc_proto_types.PublicLimitDepthV3ApiItem{{Price: "100", Quantity: "0"}}},
+		{"duplicate level", []*mexc_proto_types.PublicLimitDepthV3ApiItem{{Price: "100", Quantity: "1"}, {Price: "100", Quantity: "2"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			drainData(t)
+			require.NoError(t, e.WsHandleData(t.Context(), nil, wsPushFrame(t, "spot@"+channelLimitDepthV3+"@BTCUSDT@5", 1736411838000, good)), "a valid frame must load")
+			bad := &mexc_proto_types.PublicLimitDepthsV3Api{Asks: good.Asks, Bids: tc.bids}
+			assert.Error(t, e.WsHandleData(t.Context(), nil, wsPushFrame(t, "spot@"+channelLimitDepthV3+"@BTCUSDT@5", 1736411839000, bad)), "a malformed frame should be reported")
+			_, err := orderbook.Get(e.Name, spotTradablePair, asset.Spot)
+			assert.ErrorIs(t, err, orderbook.ErrOrderbookInvalid, "a malformed frame should invalidate the book rather than leave the previous snapshot current")
+
+			require.NoError(t, e.WsHandleData(t.Context(), nil, wsPushFrame(t, "spot@"+channelLimitDepthV3+"@BTCUSDT@5", 1736411840000, good)), "a valid frame must load")
+			book, err := orderbook.Get(e.Name, spotTradablePair, asset.Spot)
+			require.NoError(t, err, "the next valid frame must restore the book")
+			assert.Equal(t, 100.0, book.Bids[0].Price, "the restored book should hold the valid frame")
+		})
+	}
+}
+
+// TestWsHandleLimitDepthCarriesVersion asserts the depth frame's version becomes the book's update id.
+// It is the sequence REST reports as lastUpdateId, so the shared book keeps one id space whichever path
+// wrote it last; the websocket used to leave it at zero.
+func TestWsHandleLimitDepthCarriesVersion(t *testing.T) {
+	drainData(t)
+	frame := func(version string) []byte {
+		return wsPushFrame(t, "spot@"+channelLimitDepthV3+"@BTCUSDT@5", 1736411838730, &mexc_proto_types.PublicLimitDepthsV3Api{
+			Asks:    []*mexc_proto_types.PublicLimitDepthV3ApiItem{{Price: "93180.18", Quantity: "0.21976424"}},
+			Bids:    []*mexc_proto_types.PublicLimitDepthV3ApiItem{{Price: "93179.98", Quantity: "2.82651000"}},
+			Version: version,
+		})
+	}
+	require.NoError(t, e.WsHandleData(t.Context(), nil, frame("82278497395")), "WsHandleData must not error")
+	book, err := orderbook.Get(e.Name, spotTradablePair, asset.Spot)
+	require.NoError(t, err, "the snapshot must be retrievable")
+	assert.Equal(t, int64(82278497395), book.LastUpdateID, "the book should carry the frame's version as its update id")
+	assert.Error(t, e.WsHandleData(t.Context(), nil, frame("v1")), "an unreadable version should be reported")
+}
+
 // TestWsHandleBookTickerBatch asserts a batched book ticker frame merges each item onto the cached
 // ticker rather than replacing it, so it does not blank the fields the miniTicker channel maintains.
 func TestWsHandleBookTickerBatch(t *testing.T) {

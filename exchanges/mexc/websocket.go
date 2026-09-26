@@ -2,6 +2,7 @@ package mexc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -381,6 +382,14 @@ func parseOptionalFloat(v string) (float64, error) {
 	return strconv.ParseFloat(v, 64)
 }
 
+// parseOptionalInt parses an integer field which the exchange may omit entirely
+func parseOptionalInt(v string) (int64, error) {
+	if v == "" {
+		return 0, nil
+	}
+	return strconv.ParseInt(v, 10, 64)
+}
+
 // setIfNonZero keeps the previously known value when an update omits the field
 func setIfNonZero(dst *float64, v float64) {
 	if v != 0 {
@@ -659,14 +668,33 @@ func (e *Exchange) WsHandleData(ctx context.Context, conn websocket.Connection, 
 				return err
 			}
 		}
-		return e.Websocket.Orderbook.LoadSnapshot(&orderbook.Book{
-			Exchange:    e.Name,
-			Asset:       asset.Spot,
-			Bids:        bids,
-			Asks:        asks,
-			Pair:        cp,
-			LastUpdated: wsSendTime(result),
-		})
+		// version is the venue's book sequence, the same one the REST depth reports as lastUpdateId, so both
+		// paths stamp the shared book in one id space.
+		version, err := parseOptionalInt(body.Version)
+		if err != nil {
+			return err
+		}
+		book := &orderbook.Book{
+			Exchange:          e.Name,
+			Asset:             asset.Spot,
+			Bids:              bids,
+			Asks:              asks,
+			Pair:              cp,
+			LastUpdated:       wsSendTime(result),
+			LastUpdateID:      version,
+			ValidateOrderbook: e.ValidateOrderbook,
+		}
+		// Every frame is a full snapshot that replaces the book, so one that fails validation must not leave
+		// the previous snapshot in place as if it were current: invalidate the book until a valid frame
+		// arrives. Validation runs here rather than relying on LoadSnapshot's own check so that a relay
+		// error after a successful load is not mistaken for a malformed frame.
+		if err := book.Validate(); err != nil {
+			if invErr := e.Websocket.Orderbook.InvalidateOrderbook(cp, asset.Spot); invErr != nil && !errors.Is(invErr, orderbook.ErrDepthNotFound) {
+				err = common.AppendError(err, invErr)
+			}
+			return err
+		}
+		return e.Websocket.Orderbook.LoadSnapshot(book)
 	case channelBookTickerBatch:
 		cp, err := e.MatchSymbolWithAvailablePairs(result.GetSymbol(), asset.Spot, false)
 		if err != nil {
