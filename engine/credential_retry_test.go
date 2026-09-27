@@ -47,7 +47,7 @@ func TestValidateAPICredentialsGivesUpAfterRetries(t *testing.T) {
 			return errCredentialLookup
 		}, exchange.NetworkRetryDelays)
 		require.ErrorIs(t, err, errCredentialLookup, "validation must fail once the retries run out")
-		assert.Equal(t, int32(len(exchange.NetworkRetryDelays)+1), calls.Load(), "validation should make five attempts in all")
+		assert.Equal(t, len(exchange.NetworkRetryDelays)+1, int(calls.Load()), "validation should make five attempts in all")
 	})
 }
 

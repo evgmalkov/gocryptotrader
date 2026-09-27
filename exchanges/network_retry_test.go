@@ -62,7 +62,7 @@ func TestRetryAfterNetworkErrorGivesUp(t *testing.T) {
 			return errLookup
 		})
 		require.ErrorIs(t, err, errLookup, "the last network error must be reported")
-		assert.Equal(t, int32(len(exchange.NetworkRetryDelays)), calls.Load(), "the step should be retried once per delay, five attempts with the first")
+		assert.Equal(t, len(exchange.NetworkRetryDelays), int(calls.Load()), "the step should be retried once per delay, five attempts with the first")
 		assert.Equal(t, 80*time.Second, time.Since(start), "the retries should span the delays")
 	})
 }

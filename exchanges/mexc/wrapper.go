@@ -546,19 +546,24 @@ func (e *Exchange) GetWithdrawalsHistory(ctx context.Context, c currency.Code, _
 const recentTradesPerPair = 1000
 
 // wsRecentTrades holds each exchange instance's buffer of websocket trades, created on first use
-var wsRecentTrades sync.Map // *Exchange -> *trade.RecentBuffer
+var (
+	wsRecentTradesMu sync.Mutex
+	wsRecentTrades   = make(map[*Exchange]*trade.RecentBuffer)
+)
 
 // recentTrades returns this instance's buffer of the latest public websocket trades per pair
 func (e *Exchange) recentTrades() *trade.RecentBuffer {
-	if b, ok := wsRecentTrades.Load(e); ok {
-		return b.(*trade.RecentBuffer)
+	wsRecentTradesMu.Lock()
+	defer wsRecentTradesMu.Unlock()
+	if b, ok := wsRecentTrades[e]; ok {
+		return b
 	}
 	b, err := trade.NewRecentBuffer(recentTradesPerPair)
 	if err != nil {
 		panic(err) // unreachable: recentTradesPerPair is a positive constant
 	}
-	stored, _ := wsRecentTrades.LoadOrStore(e, b)
-	return stored.(*trade.RecentBuffer)
+	wsRecentTrades[e] = b
+	return b
 }
 
 // GetRecentTrades returns the most recent trades for a currency and asset. Spot trades come from the
