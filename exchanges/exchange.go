@@ -1780,11 +1780,67 @@ func (b *Base) ParallelChanOp(ctx context.Context, channels subscription.List, m
 	return errs.Collect()
 }
 
+// NetworkRetryDelays are the waits before each retry of a startup step that failed on the network: four
+// retries after the first attempt, five attempts in all, waiting from a second up to a minute
+var NetworkRetryDelays = []time.Duration{time.Second, 4 * time.Second, 15 * time.Second, time.Minute}
+
+var errNoRetryDelays = errors.New("no retry delays given")
+
+// IsNetworkError reports whether err is a transport failure, such as a failed DNS lookup or a refused
+// connection, rather than an answer from the venue
+func IsNetworkError(err error) bool {
+	_, ok := errors.AsType[net.Error](err)
+	return ok
+}
+
+// RetryAfterNetworkError retries a startup step after it failed on the network, so a venue unreachable
+// at start is not left without that step until a restart. It waits each delay in turn and calls fn
+// again, stopping at the first success, at a failure that is not a network one, once the delays run
+// out, or when ctx is done, and logs the outcome as retry ok or retry failed. The returned channel
+// receives the final error, nil on success, and is then closed; a caller that must not wait ignores it.
+func RetryAfterNetworkError(ctx context.Context, exchName, step string, delays []time.Duration, fn func(context.Context) error) <-chan error {
+	done := make(chan error, 1)
+	if len(delays) == 0 {
+		done <- errNoRetryDelays
+		close(done)
+		return done
+	}
+	go func() {
+		defer close(done)
+		var err error
+		for i, d := range delays {
+			t := time.NewTimer(d)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				log.Warnf(log.ExchangeSys, "%s: %s retry failed: stopped before attempt %d: %v", exchName, step, i+2, ctx.Err())
+				done <- ctx.Err()
+				return
+			case <-t.C:
+			}
+			if err = fn(ctx); err == nil {
+				log.Infof(log.ExchangeSys, "%s: %s retry ok on attempt %d of %d", exchName, step, i+2, len(delays)+1)
+				done <- nil
+				return
+			}
+			if !IsNetworkError(err) {
+				log.Errorf(log.ExchangeSys, "%s: %s retry failed on attempt %d with a non-network error: %v", exchName, step, i+2, err)
+				done <- err
+				return
+			}
+			log.Warnf(log.ExchangeSys, "%s: %s retry attempt %d of %d failed on the network: %v", exchName, step, i+2, len(delays)+1, err)
+		}
+		log.Errorf(log.ExchangeSys, "%s: %s retry failed after %d attempts: %v", exchName, step, len(delays)+1, err)
+		done <- err
+	}()
+	return done
+}
+
 // Bootstrap function allows for exchange authors to supplement or override common startup actions
 // If exchange.Bootstrap returns false or error it will not perform any other actions.
 // If it returns true, or is not implemented by the exchange, it will:
 // * Print debug startup information
-// * UpdateOrderExecutionLimits
+// * UpdateOrderExecutionLimits, retried in the background after a network failure (NetworkRetryDelays)
 // * UpdateTradablePairs
 func Bootstrap(ctx context.Context, b IBotExchange) error {
 	if continueBootstrap, err := b.Bootstrap(ctx); !continueBootstrap || err != nil {
@@ -1821,10 +1877,18 @@ func Bootstrap(ctx context.Context, b IBotExchange) error {
 	var errs common.ErrorCollector
 	for _, a := range b.GetAssetTypes(true) {
 		errs.Go(func() error {
-			if err := b.UpdateOrderExecutionLimits(ctx, a); err != nil && !errors.Is(err, common.ErrNotYetImplemented) {
-				return fmt.Errorf("failed to set exchange order execution limits: %w", err)
+			err := b.UpdateOrderExecutionLimits(ctx, a)
+			if err == nil || errors.Is(err, common.ErrNotYetImplemented) {
+				return nil
 			}
-			return nil
+			if IsNetworkError(err) {
+				// Nothing else reloads the limits, so a venue unreachable at start would otherwise
+				// stay without them until a restart; the failure is still reported as before.
+				RetryAfterNetworkError(ctx, b.GetName(), a.String()+" order execution limits", NetworkRetryDelays, func(ctx context.Context) error {
+					return b.UpdateOrderExecutionLimits(ctx, a)
+				})
+			}
+			return fmt.Errorf("failed to set exchange order execution limits: %w", err)
 		})
 	}
 	return errs.Collect()

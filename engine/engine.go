@@ -896,7 +896,7 @@ func (bot *Engine) LoadExchange(name string) error {
 		// type, so establish that once rather than once per asset.
 		_, err := exch.GetCredentials(ctx)
 		if err == nil {
-			err = validateAPICredentials(ctx, b.Name, enabledAssets, exch.ValidateAPICredentials)
+			err = validateAPICredentialsWithNetworkRetry(ctx, b.Name, enabledAssets, exch.ValidateAPICredentials, exchange.NetworkRetryDelays)
 		}
 		if err != nil {
 			gctlog.Warnf(gctlog.ExchangeSys, "%s: Credential validation failed, disabling authenticated support: %v", b.Name, err)
@@ -909,6 +909,21 @@ func (bot *Engine) LoadExchange(name string) error {
 	}
 
 	return exchange.Bootstrap(ctx, exch)
+}
+
+// validateAPICredentialsWithNetworkRetry validates the credentials and, when the venue could not be
+// reached, retries after each of delays before deciding. An unreachable venue says nothing about the
+// credentials, and nothing turns authenticated support back on once it is disabled, so a network blip
+// at start must not disable it; the caller waits so the decision is made before the exchange is used.
+func validateAPICredentialsWithNetworkRetry(ctx context.Context, exchangeName string, enabledAssets asset.Items, validate func(context.Context, asset.Item) error, delays []time.Duration) error {
+	err := validateAPICredentials(ctx, exchangeName, enabledAssets, validate)
+	if err == nil || !exchange.IsNetworkError(err) {
+		return err
+	}
+	gctlog.Warnf(gctlog.ExchangeSys, "%s: Credential validation failed on the network, retrying: %v", exchangeName, err)
+	return <-exchange.RetryAfterNetworkError(ctx, exchangeName, "credential validation", delays, func(ctx context.Context) error {
+		return validateAPICredentials(ctx, exchangeName, enabledAssets, validate)
+	})
 }
 
 func validateAPICredentials(ctx context.Context, exchangeName string, enabledAssets asset.Items, validate func(context.Context, asset.Item) error) error {
