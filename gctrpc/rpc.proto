@@ -668,8 +668,12 @@ message SavedTrades {
   double price = 1;
   double amount = 2;
   string side = 3;
+  // timestamp is the trade time to the second, formatted
   string timestamp = 4;
   string trade_id = 5;
+  // timestamp_ms is the trade time in Unix milliseconds, as precise as the exchange gave it; zero from a
+  // server predating it
+  int64 timestamp_ms = 6;
 }
 
 message SavedTradesResponse {

@@ -3135,11 +3135,12 @@ func (s *RPCServer) GetSavedTrades(_ context.Context, r *gctrpc.GetSavedTradesRe
 	}
 	for i := range trades {
 		resp.Trades = append(resp.Trades, &gctrpc.SavedTrades{
-			Price:     trades[i].Price,
-			Amount:    trades[i].Amount,
-			Side:      trades[i].Side.String(),
-			Timestamp: trades[i].Timestamp.In(time.UTC).Format(common.SimpleTimeFormatWithTimezone),
-			TradeId:   trades[i].TID,
+			Price:       trades[i].Price,
+			Amount:      trades[i].Amount,
+			Side:        trades[i].Side.String(),
+			Timestamp:   trades[i].Timestamp.In(time.UTC).Format(common.SimpleTimeFormatWithTimezone),
+			TradeId:     trades[i].TID,
+			TimestampMs: trades[i].Timestamp.UnixMilli(),
 		})
 	}
 	if len(resp.Trades) == 0 {
@@ -3494,11 +3495,12 @@ func (s *RPCServer) GetHistoricTrades(r *gctrpc.GetSavedTradesRequest, stream gc
 				break
 			}
 			grpcTrades.Trades = append(grpcTrades.Trades, &gctrpc.SavedTrades{
-				Price:     trades[i].Price,
-				Amount:    trades[i].Amount,
-				Side:      trades[i].Side.String(),
-				Timestamp: tradeTS.Format(common.SimpleTimeFormatWithTimezone),
-				TradeId:   trades[i].TID,
+				Price:       trades[i].Price,
+				Amount:      trades[i].Amount,
+				Side:        trades[i].Side.String(),
+				Timestamp:   tradeTS.Format(common.SimpleTimeFormatWithTimezone),
+				TradeId:     trades[i].TID,
+				TimestampMs: tradeTS.UnixMilli(),
 			})
 		}
 
@@ -3545,11 +3547,12 @@ func (s *RPCServer) GetRecentTrades(ctx context.Context, r *gctrpc.GetSavedTrade
 	}
 	for i := range trades {
 		resp.Trades = append(resp.Trades, &gctrpc.SavedTrades{
-			Price:     trades[i].Price,
-			Amount:    trades[i].Amount,
-			Side:      trades[i].Side.String(),
-			Timestamp: trades[i].Timestamp.In(time.UTC).Format(common.SimpleTimeFormatWithTimezone),
-			TradeId:   trades[i].TID,
+			Price:       trades[i].Price,
+			Amount:      trades[i].Amount,
+			Side:        trades[i].Side.String(),
+			Timestamp:   trades[i].Timestamp.In(time.UTC).Format(common.SimpleTimeFormatWithTimezone),
+			TradeId:     trades[i].TID,
+			TimestampMs: trades[i].Timestamp.UnixMilli(),
 		})
 	}
 	if len(resp.Trades) == 0 {

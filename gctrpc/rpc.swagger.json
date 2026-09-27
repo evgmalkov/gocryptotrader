@@ -7092,10 +7092,16 @@
           "type": "string"
         },
         "timestamp": {
-          "type": "string"
+          "type": "string",
+          "title": "timestamp is the trade time to the second, formatted"
         },
         "tradeId": {
           "type": "string"
+        },
+        "timestampMs": {
+          "type": "string",
+          "format": "int64",
+          "title": "timestamp_ms is the trade time in Unix milliseconds, as precise as the exchange gave it; zero from a\nserver predating it"
         }
       }
     },

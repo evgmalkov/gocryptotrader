@@ -6748,12 +6748,16 @@ func (x *GetSavedTradesRequest) GetEnd() string {
 }
 
 type SavedTrades struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Price         float64                `protobuf:"fixed64,1,opt,name=price,proto3" json:"price,omitempty"`
-	Amount        float64                `protobuf:"fixed64,2,opt,name=amount,proto3" json:"amount,omitempty"`
-	Side          string                 `protobuf:"bytes,3,opt,name=side,proto3" json:"side,omitempty"`
-	Timestamp     string                 `protobuf:"bytes,4,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	TradeId       string                 `protobuf:"bytes,5,opt,name=trade_id,json=tradeId,proto3" json:"trade_id,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Price  float64                `protobuf:"fixed64,1,opt,name=price,proto3" json:"price,omitempty"`
+	Amount float64                `protobuf:"fixed64,2,opt,name=amount,proto3" json:"amount,omitempty"`
+	Side   string                 `protobuf:"bytes,3,opt,name=side,proto3" json:"side,omitempty"`
+	// timestamp is the trade time to the second, formatted
+	Timestamp string `protobuf:"bytes,4,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	TradeId   string `protobuf:"bytes,5,opt,name=trade_id,json=tradeId,proto3" json:"trade_id,omitempty"`
+	// timestamp_ms is the trade time in Unix milliseconds, as precise as the exchange gave it; zero from a
+	// server predating it
+	TimestampMs   int64 `protobuf:"varint,6,opt,name=timestamp_ms,json=timestampMs,proto3" json:"timestamp_ms,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6821,6 +6825,13 @@ func (x *SavedTrades) GetTradeId() string {
 		return x.TradeId
 	}
 	return ""
+}
+
+func (x *SavedTrades) GetTimestampMs() int64 {
+	if x != nil {
+		return x.TimestampMs
+	}
+	return 0
 }
 
 type SavedTradesResponse struct {
@@ -15658,13 +15669,14 @@ const file_rpc_proto_rawDesc = "" +
 	"\n" +
 	"asset_type\x18\x03 \x01(\tR\tassetType\x12\x14\n" +
 	"\x05start\x18\x04 \x01(\tR\x05start\x12\x10\n" +
-	"\x03end\x18\x05 \x01(\tR\x03end\"\x88\x01\n" +
+	"\x03end\x18\x05 \x01(\tR\x03end\"\xab\x01\n" +
 	"\vSavedTrades\x12\x14\n" +
 	"\x05price\x18\x01 \x01(\x01R\x05price\x12\x16\n" +
 	"\x06amount\x18\x02 \x01(\x01R\x06amount\x12\x12\n" +
 	"\x04side\x18\x03 \x01(\tR\x04side\x12\x1c\n" +
 	"\ttimestamp\x18\x04 \x01(\tR\ttimestamp\x12\x19\n" +
-	"\btrade_id\x18\x05 \x01(\tR\atradeId\"\xa7\x01\n" +
+	"\btrade_id\x18\x05 \x01(\tR\atradeId\x12!\n" +
+	"\ftimestamp_ms\x18\x06 \x01(\x03R\vtimestampMs\"\xa7\x01\n" +
 	"\x13SavedTradesResponse\x12#\n" +
 	"\rexchange_name\x18\x01 \x01(\tR\fexchangeName\x12\x14\n" +
 	"\x05asset\x18\x02 \x01(\tR\x05asset\x12(\n" +
