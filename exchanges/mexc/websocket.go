@@ -675,14 +675,12 @@ func (e *Exchange) WsHandleData(ctx context.Context, conn websocket.Connection, 
 		}
 		return nil
 	case channelAggreDealsV3:
-		// Read both trade settings per frame so a feed switched on after setup takes effect straight
-		// away; skip the work entirely when neither wants the trades. The private deals channel is
-		// separate and carries the account's own fills.
+		// Every public trade is kept in the recent trades buffer GetRecentTrades answers from, since
+		// only this channel carries trade ids. Both trade settings are read per frame so a feed switched
+		// on after setup takes effect straight away. The private deals channel is separate and carries
+		// the account's own fills.
 		saveTradeData := e.IsSaveTradeDataEnabled()
 		tradeFeed := e.IsTradeFeedEnabled()
-		if !saveTradeData && !tradeFeed {
-			return nil
-		}
 		cp, err := e.MatchSymbolWithAvailablePairs(result.GetSymbol(), asset.Spot, false)
 		if err != nil {
 			return err
@@ -716,6 +714,9 @@ func (e *Exchange) WsHandleData(ctx context.Context, conn websocket.Connection, 
 					return order.Sell
 				}(),
 			}
+		}
+		if err := e.recentTrades().Add(tradesDetail...); err != nil {
+			return err
 		}
 		if tradeFeed {
 			if err := e.Websocket.DataHandler.Send(ctx, tradesDetail); err != nil {

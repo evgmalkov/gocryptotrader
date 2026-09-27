@@ -6,6 +6,7 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/thrasher-corp/gocryptotrader/common"
@@ -540,7 +541,29 @@ func (e *Exchange) GetWithdrawalsHistory(ctx context.Context, c currency.Code, _
 	return resp, nil
 }
 
-// GetRecentTrades returns the most recent trades for a currency and asset
+// recentTradesPerPair bounds the websocket trades kept per pair for GetRecentTrades: the most the REST
+// recent trades endpoint answers, so the websocket answer is never longer than a REST one could be
+const recentTradesPerPair = 1000
+
+// wsRecentTrades holds each exchange instance's buffer of websocket trades, created on first use
+var wsRecentTrades sync.Map // *Exchange -> *trade.RecentBuffer
+
+// recentTrades returns this instance's buffer of the latest public websocket trades per pair
+func (e *Exchange) recentTrades() *trade.RecentBuffer {
+	if b, ok := wsRecentTrades.Load(e); ok {
+		return b.(*trade.RecentBuffer)
+	}
+	b, err := trade.NewRecentBuffer(recentTradesPerPair)
+	if err != nil {
+		panic(err) // unreachable: recentTradesPerPair is a positive constant
+	}
+	stored, _ := wsRecentTrades.LoadOrStore(e, b)
+	return stored.(*trade.RecentBuffer)
+}
+
+// GetRecentTrades returns the most recent trades for a currency and asset. Spot trades come from the
+// public websocket trade stream once it has delivered any for the pair, oldest first, since only the
+// websocket carries trade ids; until then the REST endpoint answers, without them.
 func (e *Exchange) GetRecentTrades(ctx context.Context, p currency.Pair, assetType asset.Item) ([]trade.Data, error) {
 	p, err := e.FormatExchangeCurrency(p, assetType)
 	if err != nil {
@@ -548,6 +571,9 @@ func (e *Exchange) GetRecentTrades(ctx context.Context, p currency.Pair, assetTy
 	}
 	switch assetType {
 	case asset.Spot:
+		if streamed := e.recentTrades().Get(e.Name, assetType, p); len(streamed) > 0 {
+			return streamed, nil
+		}
 		result, err := e.GetRecentTradesList(ctx, p, 0)
 		if err != nil {
 			return nil, err
