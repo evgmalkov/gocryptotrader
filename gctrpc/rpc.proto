@@ -821,6 +821,9 @@ message WebsocketGetInfoResponse {
   bool authenticated = 5;
   string running_url = 6;
   string proxy_address = 7;
+  // connected reports whether the websocket is connected right now, which enabled does not: an enabled
+  // websocket can be down. It is always set, so a response without it comes from a server predating it.
+  optional bool connected = 8;
 }
 
 message WebsocketSetEnabledRequest {

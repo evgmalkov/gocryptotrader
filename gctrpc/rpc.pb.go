@@ -8300,8 +8300,11 @@ type WebsocketGetInfoResponse struct {
 	Authenticated          bool                   `protobuf:"varint,5,opt,name=authenticated,proto3" json:"authenticated,omitempty"`
 	RunningUrl             string                 `protobuf:"bytes,6,opt,name=running_url,json=runningUrl,proto3" json:"running_url,omitempty"`
 	ProxyAddress           string                 `protobuf:"bytes,7,opt,name=proxy_address,json=proxyAddress,proto3" json:"proxy_address,omitempty"`
-	unknownFields          protoimpl.UnknownFields
-	sizeCache              protoimpl.SizeCache
+	// connected reports whether the websocket is connected right now, which enabled does not: an enabled
+	// websocket can be down. It is always set, so a response without it comes from a server predating it.
+	Connected     *bool `protobuf:"varint,8,opt,name=connected,proto3,oneof" json:"connected,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *WebsocketGetInfoResponse) Reset() {
@@ -8381,6 +8384,13 @@ func (x *WebsocketGetInfoResponse) GetProxyAddress() string {
 		return x.ProxyAddress
 	}
 	return ""
+}
+
+func (x *WebsocketGetInfoResponse) GetConnected() bool {
+	if x != nil && x.Connected != nil {
+		return *x.Connected
+	}
+	return false
 }
 
 type WebsocketSetEnabledRequest struct {
@@ -15760,7 +15770,7 @@ const file_rpc_proto_rawDesc = "" +
 	"\x19GetExchangeAssetsResponse\x12\x16\n" +
 	"\x06assets\x18\x01 \x01(\tR\x06assets\"5\n" +
 	"\x17WebsocketGetInfoRequest\x12\x1a\n" +
-	"\bexchange\x18\x01 \x01(\tR\bexchange\"\x93\x02\n" +
+	"\bexchange\x18\x01 \x01(\tR\bexchange\"\xc4\x02\n" +
 	"\x18WebsocketGetInfoResponse\x12\x1a\n" +
 	"\bexchange\x18\x01 \x01(\tR\bexchange\x12\x1c\n" +
 	"\tsupported\x18\x02 \x01(\bR\tsupported\x12\x18\n" +
@@ -15769,7 +15779,10 @@ const file_rpc_proto_rawDesc = "" +
 	"\rauthenticated\x18\x05 \x01(\bR\rauthenticated\x12\x1f\n" +
 	"\vrunning_url\x18\x06 \x01(\tR\n" +
 	"runningUrl\x12#\n" +
-	"\rproxy_address\x18\a \x01(\tR\fproxyAddress\"P\n" +
+	"\rproxy_address\x18\a \x01(\tR\fproxyAddress\x12!\n" +
+	"\tconnected\x18\b \x01(\bH\x00R\tconnected\x88\x01\x01B\f\n" +
+	"\n" +
+	"_connected\"P\n" +
 	"\x1aWebsocketSetEnabledRequest\x12\x1a\n" +
 	"\bexchange\x18\x01 \x01(\tR\bexchange\x12\x16\n" +
 	"\x06enable\x18\x02 \x01(\bR\x06enable\">\n" +
@@ -17150,6 +17163,7 @@ func file_rpc_proto_init() {
 	if File_rpc_proto != nil {
 		return
 	}
+	file_rpc_proto_msgTypes[139].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

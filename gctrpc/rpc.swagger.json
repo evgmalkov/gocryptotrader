@@ -7619,6 +7619,10 @@
         },
         "proxyAddress": {
           "type": "string"
+        },
+        "connected": {
+          "type": "boolean",
+          "description": "connected reports whether the websocket is connected right now, which enabled does not: an enabled\nwebsocket can be down. It is always set, so a response without it comes from a server predating it."
         }
       }
     },

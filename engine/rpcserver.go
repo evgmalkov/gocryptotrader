@@ -2967,6 +2967,7 @@ func (s *RPCServer) WebsocketGetInfo(_ context.Context, r *gctrpc.WebsocketGetIn
 		return nil, err
 	}
 
+	connected := w.IsConnected()
 	return &gctrpc.WebsocketGetInfoResponse{
 		Exchange:      exch.GetName(),
 		Supported:     exch.SupportsWebsocket(),
@@ -2974,6 +2975,7 @@ func (s *RPCServer) WebsocketGetInfo(_ context.Context, r *gctrpc.WebsocketGetIn
 		Authenticated: w.CanUseAuthenticatedEndpoints(),
 		RunningUrl:    w.GetWebsocketURL(),
 		ProxyAddress:  w.GetProxyAddress(),
+		Connected:     &connected,
 	}, nil
 }
 
