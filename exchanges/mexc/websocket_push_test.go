@@ -1,6 +1,7 @@
 package mexc
 
 import (
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -123,19 +124,34 @@ func TestWsHandleLimitDepth(t *testing.T) {
 	drainData(t)
 	raw := wsPushFrame(t, "spot@"+channelLimitDepthV3+"@BTCUSDT@5", 1736411838730,
 		&mexc_proto_types.PublicLimitDepthsV3Api{
-			Asks: []*mexc_proto_types.PublicLimitDepthV3ApiItem{{Price: "93180.18", Quantity: "0.21976424"}},
-			Bids: []*mexc_proto_types.PublicLimitDepthV3ApiItem{{Price: "93179.98", Quantity: "2.82651000"}},
+			Asks:    []*mexc_proto_types.PublicLimitDepthV3ApiItem{{Price: "93180.18", Quantity: "0.21976424"}},
+			Bids:    []*mexc_proto_types.PublicLimitDepthV3ApiItem{{Price: "93179.98", Quantity: "2.82651000"}},
+			Version: "36913293511",
 		})
 	require.NoError(t, e.WsHandleData(t.Context(), nil, raw), "WsHandleData must not error")
 
 	book, err := orderbook.Get(e.Name, spotTradablePair, asset.Spot)
 	require.NoError(t, err, "the snapshot must be retrievable")
+	assert.Equal(t, int64(36913293511), book.LastUpdateID, "LastUpdateID should be the pushed version")
 	require.Len(t, book.Asks, 1, "the ask side must hold the pushed level")
 	require.Len(t, book.Bids, 1, "the bid side must hold the pushed level")
 	assert.Equal(t, 93180.18, book.Asks[0].Price, "ask price should be correct")
 	assert.Equal(t, 0.21976424, book.Asks[0].Amount, "ask amount should be correct")
 	assert.Equal(t, 93179.98, book.Bids[0].Price, "bid price should be correct")
 	assert.Equal(t, 2.82651, book.Bids[0].Amount, "bid amount should be correct")
+}
+
+// TestWsHandleLimitDepthRejectsBadVersion errors on a limit depth push whose version is not a number rather
+// than loading the book with a made-up update id.
+func TestWsHandleLimitDepthRejectsBadVersion(t *testing.T) {
+	drainData(t)
+	raw := wsPushFrame(t, "spot@"+channelLimitDepthV3+"@BTCUSDT@5", 1736411838730,
+		&mexc_proto_types.PublicLimitDepthsV3Api{
+			Asks:    []*mexc_proto_types.PublicLimitDepthV3ApiItem{{Price: "93180.18", Quantity: "0.21976424"}},
+			Bids:    []*mexc_proto_types.PublicLimitDepthV3ApiItem{{Price: "93179.98", Quantity: "2.82651000"}},
+			Version: "v1",
+		})
+	assert.ErrorIs(t, e.WsHandleData(t.Context(), nil, raw), strconv.ErrSyntax, "WsHandleData should error on a version that is not a number")
 }
 
 // TestWsHandleLimitDepthUsesExchangeTime asserts the orderbook snapshot is stamped with the frame's
@@ -218,7 +234,7 @@ func TestDepthSubscriptionFailureInvalidatesBook(t *testing.T) {
 	const tickerChannel = "spot@" + channelBookTiker + "@100ms@BTCUSDT"
 	accepted := func(ch string) string { return `{"id":0,"code":0,"msg":"` + ch + `"}` }
 	refused := func(ch string) string {
-		return `{"id":0,"code":0,"msg":"Not Subscribed successfully! [` + ch + `].  Reason： Blocked! "}`
+		return `{"id":0,"code":0,"msg":"Not Subscribed successfully! [` + ch + `].  Reason: Blocked! "}`
 	}
 	newSub := func(channel, qualified string) *subscription.Subscription {
 		return &subscription.Subscription{Channel: channel, Asset: asset.Spot, Pairs: currency.Pairs{spotTradablePair}, Levels: 5, QualifiedChannel: qualified}
@@ -272,7 +288,7 @@ func TestBookTickerSubscriptionFailureClearsBidAsk(t *testing.T) {
 	const bookChannel = "spot@" + channelBookTiker + "@100ms@BTCUSDT"
 	const miniChannel = "spot@" + channelMiniTickerV3 + "@BTCUSDT@" + miniTickerTimezone
 	refused := func(ch string) string {
-		return `{"id":0,"code":0,"msg":"Not Subscribed successfully! [` + ch + `].  Reason： Blocked! "}`
+		return `{"id":0,"code":0,"msg":"Not Subscribed successfully! [` + ch + `].  Reason: Blocked! "}`
 	}
 	newSub := func(channel, qualified string) *subscription.Subscription {
 		return &subscription.Subscription{Channel: channel, Asset: asset.Spot, Pairs: currency.Pairs{spotTradablePair}, QualifiedChannel: qualified}
@@ -455,6 +471,7 @@ func TestWsHandlePrivateAccount(t *testing.T) {
 	assert.Equal(t, 0.5, stored.Hold, "the stored hold should be the frozen amount")
 	assert.Equal(t, 100.5, stored.Free, "the stored free balance should be the available amount")
 
+	require.Len(t, ex.Websocket.DataHandler.C, 1, "one payload must be relayed")
 	payload := <-ex.Websocket.DataHandler.C
 	subAccounts, ok := payload.Data.(accounts.SubAccounts)
 	require.Truef(t, ok, "payload must be accounts.SubAccounts, got %T", payload.Data)
@@ -509,6 +526,8 @@ func TestWsHandlePrivateOrders(t *testing.T) {
 	assert.Equal(t, 10.0, detail.Amount, "Amount should be the base quantity")
 	assert.Equal(t, 1000.0, detail.QuoteAmount, "QuoteAmount should be the quote amount")
 	assert.Equal(t, 404.0, detail.Cost, "Cost should be the cumulative quote amount")
+	assert.Equal(t, detail.Pair.Quote, detail.CostAsset, "CostAsset should be the quote currency")
+	assert.False(t, detail.CostAsset.IsEmpty(), "CostAsset should be set")
 	assert.Equal(t, 4.0, detail.ExecutedAmount, "ExecutedAmount should be the base cumulative quantity")
 	assert.Equal(t, 6.0, detail.RemainingAmount, "RemainingAmount should be the base remaining quantity")
 	assert.Equal(t, order.Limit, detail.Type, "orderType 1 should map to a limit order")

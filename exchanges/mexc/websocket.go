@@ -49,7 +49,7 @@ const (
 	channelPrivateOrdersAPI = "private.orders.v3.api.pb"
 
 	// miniTickerTimezone is a mandatory suffix of the spot miniTicker and miniTickers channels: MEXC
-	// rejects the subscription without it ("Not Subscribed successfully! ... Reason: Blocked!" — measured
+	// rejects the subscription without it ("Not Subscribed successfully! ... Reason: Blocked!", measured
 	// live).
 	// It only shifts the rate fields we do not consume; price/high/low/volume are timezone-agnostic.
 	miniTickerTimezone = "UTC+8"
@@ -57,13 +57,25 @@ const (
 	wsPongMessage = "PONG"
 )
 
-// WsConnect initiates a websocket connection
+// privateConnection filters the connection carrying the private channels
+const privateConnection = "private"
+
+// WsConnect initiates a public websocket connection
 func (e *Exchange) WsConnect(ctx context.Context, conn websocket.Connection) error {
+	return e.wsDial(ctx, conn, false)
+}
+
+// wsConnectPrivate initiates the websocket connection carrying the private channels
+func (e *Exchange) wsConnectPrivate(ctx context.Context, conn websocket.Connection) error {
+	return e.wsDial(ctx, conn, true)
+}
+
+func (e *Exchange) wsDial(ctx context.Context, conn websocket.Connection, private bool) error {
 	if !e.Websocket.IsEnabled() || !e.IsEnabled() {
 		return websocket.ErrWebsocketNotEnabled
 	}
 	var listenKey string
-	if e.Websocket.CanUseAuthenticatedEndpoints() {
+	if private && e.Websocket.CanUseAuthenticatedEndpoints() {
 		var err error
 		if listenKey, err = e.GenerateListenKey(ctx); err != nil {
 			return err
@@ -274,6 +286,33 @@ func (e *Exchange) generateSubscriptions() (subscription.List, error) {
 	return e.Features.Subscriptions.ExpandTemplates(e)
 }
 
+// isPrivateChannel reports whether an expanded subscription is to a private channel, which is only served
+// over a connection dialled with a listen key. It goes by the qualified channel rather than the
+// Authenticated flag, which a configured subscription can leave out.
+func isPrivateChannel(s *subscription.Subscription) bool {
+	switch wsChannelName(s.QualifiedChannel) {
+	case channelAccountV3, channelPrivateDealsV3, channelPrivateOrdersAPI:
+		return true
+	}
+	return false
+}
+
+// generatePublicSubscriptions returns the configured subscriptions to the public channels
+func (e *Exchange) generatePublicSubscriptions() (subscription.List, error) {
+	subs, err := e.generateSubscriptions()
+	return slices.DeleteFunc(subs, isPrivateChannel), err
+}
+
+// generatePrivateSubscriptions returns the configured subscriptions to the private channels, none unless the
+// authenticated websocket can be used
+func (e *Exchange) generatePrivateSubscriptions() (subscription.List, error) {
+	if !e.Websocket.CanUseAuthenticatedEndpoints() {
+		return nil, nil
+	}
+	subs, err := e.generateSubscriptions()
+	return slices.DeleteFunc(subs, func(s *subscription.Subscription) bool { return !isPrivateChannel(s) }), err
+}
+
 // GetSubscriptionTemplate returns a subscription channel template
 func (e *Exchange) GetSubscriptionTemplate(_ *subscription.Subscription) (*template.Template, error) {
 	return template.New("master.tmpl").
@@ -298,7 +337,7 @@ func wsIntervalString(s *subscription.Subscription) string {
 
 // wsChannelName returns the channel name of a qualified push channel. MEXC qualifies a channel as
 // "spot@<name>[@<extra>...]": a public channel carries an interval and/or a symbol after the name,
-// a private channel carries nothing. The name must be read from the decoded frame — splitting the
+// a private channel carries nothing. The name must be read from the decoded frame: splitting the
 // raw protobuf bytes on "@" returns the name glued to the binary body whenever nothing follows it,
 // which matched no case and made every private channel unroutable.
 func wsChannelName(qualifiedChannel string) string {
@@ -333,7 +372,7 @@ func channelSuffix(channel string) string {
 
 // subscriptionAccepted reports whether MEXC actually accepted the subscription. MEXC answers a
 // rejected subscription with code 0 and an error text in msg (measured live:
-// `code=0 msg="Not Subscribed successfully! [<channel>]. Reason： Blocked!"`), so the code alone
+// `code=0 msg="Not Subscribed successfully! [<channel>]. Reason: Blocked!"`), so the code alone
 // cannot distinguish success from failure and a rejected channel would be registered as live.
 // An accepted request echoes the qualified channel back verbatim.
 func subscriptionAccepted(method, qualifiedChannel, msg string) bool {
@@ -382,7 +421,7 @@ func (e *Exchange) handleSubscription(ctx context.Context, conn websocket.Connec
 		// A confirmed unsubscription removes the channel from the active set; a rejected one is left
 		// registered because it is still live. The previous code added every confirmed channel via
 		// AddSuccessfulSubscriptions, so an accepted unsubscribe (MEXC replies code 0 echoing the
-		// channel — measured live) re-registered the channel it had just cancelled.
+		// channel, measured live) re-registered the channel it had just cancelled.
 		err := e.Websocket.RemoveSubscriptions(conn, confirmed...)
 		if len(rejected) > 0 {
 			err = common.AppendError(err, fmt.Errorf("%w: %s", websocket.ErrSubscriptionsNotRemoved, rejected))
@@ -453,8 +492,8 @@ func (e *Exchange) invalidateDepthBooks(subs subscription.List) error {
 }
 
 // wsUpdateSpotTicker merges a partial spot ticker update into the cached ticker and publishes it.
-// MEXC splits the spot ticker over two channels — bookTicker carries the best bid/offer only and
-// miniTicker carries last/high/low/volume — so each update must be applied on top of the current
+// MEXC splits the spot ticker over two channels, bookTicker carrying the best bid/offer only and
+// miniTicker carrying last/high/low/volume, so each update must be applied on top of the current
 // ticker instead of replacing it, otherwise every channel would blank the other one's fields.
 func (e *Exchange) wsUpdateSpotTicker(ctx context.Context, cp currency.Pair, updated time.Time, apply func(*ticker.Price)) error {
 	// bookTicker and miniTicker for one pair can land on different connections once subscriptions span
@@ -491,7 +530,7 @@ func (e *Exchange) wsUpdateSpotMiniTicker(ctx context.Context, cp currency.Pair,
 		return err
 	}
 	// Measured against GET /api/v3/ticker/24hr for KASUSDT: miniTicker `quantity` is the base
-	// asset volume and `volume` is the quote volume — the opposite of the REST field naming.
+	// asset volume and `volume` is the quote volume, the opposite of the REST field naming.
 	baseVolume, err := parseOptionalFloat(body.Quantity)
 	if err != nil {
 		return err
@@ -1010,6 +1049,7 @@ func (e *Exchange) WsHandleData(ctx context.Context, conn websocket.Connection, 
 			QuoteAmount:          nums.amount,
 			// cumulativeAmount is the quote actually spent; without it a filled order reports a zero cost.
 			Cost:            nums.cumulativeAmount,
+			CostAsset:       cp.Quote,
 			ExecutedAmount:  nums.cumulativeQuantity,
 			RemainingAmount: nums.remainQuantity,
 			OrderID:         body.Id,

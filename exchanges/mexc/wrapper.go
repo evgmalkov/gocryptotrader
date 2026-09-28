@@ -16,7 +16,6 @@ import (
 	"github.com/thrasher-corp/gocryptotrader/exchange/accounts"
 	"github.com/thrasher-corp/gocryptotrader/exchange/order/limits"
 	"github.com/thrasher-corp/gocryptotrader/exchange/websocket"
-	"github.com/thrasher-corp/gocryptotrader/exchange/websocket/buffer"
 	exchange "github.com/thrasher-corp/gocryptotrader/exchanges"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/asset"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/deposit"
@@ -136,7 +135,6 @@ func (e *Exchange) SetDefaults() {
 	e.Websocket = websocket.NewManager()
 	e.WebsocketResponseMaxLimit = exchange.DefaultWebsocketResponseMaxLimit
 	e.WebsocketResponseCheckTimeout = exchange.DefaultWebsocketResponseCheckTimeout
-	e.WebsocketOrderbookBufferLimit = exchange.DefaultWebsocketOrderbookBufferLimit
 }
 
 // Setup takes in the supplied exchange configuration details and sets params
@@ -162,16 +160,12 @@ func (e *Exchange) Setup(exch *config.Exchange) error {
 		MaxWebsocketSubscriptionsPerConnection: 30,
 		DefaultURL:                             spotWebsocketURL,
 		RunningURL:                             spotWebsocketURL,
-		OrderbookBufferConfig: buffer.Config{
-			SortBuffer:            true,
-			SortBufferByUpdateIDs: true,
-		},
-		TradeFeed:                    e.Features.Enabled.TradeFeed,
-		UseMultiConnectionManagement: true,
+		TradeFeed:                              e.Features.Enabled.TradeFeed,
+		UseMultiConnectionManagement:           true,
 	}); err != nil {
 		return err
 	}
-	return e.Websocket.SetupNewConnection(&websocket.ConnectionSetup{
+	if err := e.Websocket.SetupNewConnection(&websocket.ConnectionSetup{
 		URL:                   spotWSURL,
 		ResponseCheckTimeout:  exch.WebsocketResponseCheckTimeout,
 		ResponseMaxLimit:      time.Second * 3,
@@ -179,9 +173,26 @@ func (e *Exchange) Setup(exch *config.Exchange) error {
 		Connector:             e.WsConnect,
 		Subscriber:            e.Subscribe,
 		Unsubscriber:          e.Unsubscribe,
-		GenerateSubscriptions: e.generateSubscriptions,
+		GenerateSubscriptions: e.generatePublicSubscriptions,
 		Handler:               e.WsHandleData,
 		MessageFilter:         asset.Spot,
+	}); err != nil {
+		return err
+	}
+	// Only the private channels need a listen key, so they have a connection of their own, set up last so
+	// that a public connection failing to connect ends the connect before a key is minted.
+	return e.Websocket.SetupNewConnection(&websocket.ConnectionSetup{
+		URL:                   spotWSURL,
+		ResponseCheckTimeout:  exch.WebsocketResponseCheckTimeout,
+		ResponseMaxLimit:      time.Second * 3,
+		RateLimit:             request.NewRateLimitWithWeight(time.Second, 2, 1),
+		Authenticated:         true,
+		Connector:             e.wsConnectPrivate,
+		Subscriber:            e.Subscribe,
+		Unsubscriber:          e.Unsubscribe,
+		GenerateSubscriptions: e.generatePrivateSubscriptions,
+		Handler:               e.WsHandleData,
+		MessageFilter:         privateConnection,
 	})
 }
 
@@ -785,7 +796,7 @@ func (e *Exchange) SubmitOrder(ctx context.Context, s *order.Submit) (*order.Sub
 		case result.OrderID != "":
 			// MEXC's create-order ACK omits status; a populated OrderID from a successful NewOrder
 			// means the order was placed, so report New to keep WasOrderPlaced() true instead of
-			// UnknownStatus. The sweep resolves the real lifecycle status (FILLED/PARTIALLY_FILLED/…)
+			// UnknownStatus. The sweep resolves the real lifecycle status (FILLED, PARTIALLY_FILLED and so on)
 			// from GetOrderInfo afterwards.
 			ordStatus = order.New
 		}
@@ -904,19 +915,21 @@ const accountTradesMaxPages = 20
 // tradesForOrder fetches the fills of a spot order and maps them to domain trade records plus the
 // aggregated commission. MEXC charges commission per fill in an asset the venue chooses (base,
 // quote, or the MX discount token), so the fee currency is read from the fill and never assumed;
-// when fills disagree on the asset the aggregate currency is left unset. It is best-effort: a
-// myTrades failure must not sink the order lookup, so callers pass through the base order.
+// when the fills charged a commission disagree on its asset, the aggregate is left unset. It is
+// best-effort: a myTrades failure must not sink the order lookup, so callers pass through the base
+// order.
 //
 // myTrades returns at most 1000 fills per request, newest first and stamped to the second, with no
 // cursor, and its fill ids do not follow the fills' order. When a page comes back full, the fills
 // are read on in windows from the order's creation to the end of the oldest second of the page,
-// which a full page can stop part-way through, dropping fills already read by id. The reads stop
-// when a page is not full, after accountTradesMaxPages requests, or when a full page does not reach
-// back past its oldest second, as when more fills share one second than a page holds; the fills read
-// so far are then reported with a warning. executed is the order's executed quantity: when the
-// fills read sum to less, they are reported with a warning. It is read before the fills, so an order
-// still filling can have more fills than it counts, and a sum at or above it is not proof that none
-// is missing.
+// which a full page can stop part-way through, dropping fills already read by id. A second holding
+// a page of fills or more is passed over with a warning, since the rest of its fills cannot be read,
+// and the reads go on from the second before it unless the order was created in that second or later.
+// The reads stop when a page is not full, or with a warning when a page holds fills after the end of its
+// window or after accountTradesMaxPages requests; the fills read so far are then reported. executed is
+// the order's executed quantity: when the fills read sum to less, they are reported with a warning. It
+// is read before the fills, so an order still filling can have more fills than it counts, and a sum at
+// or above it is not proof that none is missing.
 func (e *Exchange) tradesForOrder(ctx context.Context, pair currency.Pair, orderID string, created time.Time, executed decimal.Decimal) (trades []order.TradeHistory, totalFee float64, feeAsset currency.Code) {
 	// MEXC can report an order as filled a moment before its fills surface in myTrades, so a single
 	// immediate lookup sometimes finds nothing for a just-completed order. Retry once with a short
@@ -945,12 +958,21 @@ func (e *Exchange) tradesForOrder(ctx context.Context, pair currency.Pair, order
 	}
 	fills := make([]*AccountTrade, 0, len(page))
 	seen := make(map[string]struct{}, len(page))
+	// The order's time carries milliseconds but its fills are stamped to the second, so the windows start at
+	// the second the order was created in; starting at its time would leave out the fills of that second.
+	start := created.Truncate(time.Second)
+	// end is the end of the window the page was read from; the first page is read without one
+	var end time.Time
 	for requests := 1; ; requests++ {
 		for _, f := range page {
 			if _, ok := seen[f.ID]; !ok {
 				seen[f.ID] = struct{}{}
 				fills = append(fills, f)
 			}
+		}
+		if !end.IsZero() && slices.ContainsFunc(page, func(f *AccountTrade) bool { return f.Time.Time().After(end) }) {
+			log.Warnf(log.ExchangeSys, "%s: myTrades answered for order %s (%s) outside the window read; commission covers %d fills", e.Name, orderID, pair, len(fills))
+			break
 		}
 		if len(page) < accountTradesPageLimit {
 			break
@@ -965,30 +987,27 @@ func (e *Exchange) tradesForOrder(ctx context.Context, pair currency.Pair, order
 				oldest = f.Time.Time()
 			}
 		}
-		end := oldest.Truncate(time.Second).Add(time.Second - time.Millisecond)
-		start := created
-		if !start.Before(end) {
-			start = time.Time{}
+		second := oldest.Truncate(time.Second)
+		if end.Equal(second.Add(time.Second - time.Millisecond)) {
+			// A full page read up to the end of its oldest second never left that second, so the second holds a
+			// page of fills or more: the rest of them cannot be read, but the seconds before it can.
+			log.Warnf(log.ExchangeSys, "%s: order %s (%s) has a myTrades page or more of fills in the second at %s; commission may not cover all of them", e.Name, orderID, pair, second)
+			if !start.Before(second) {
+				break
+			}
+			end = second.Add(-time.Millisecond)
+		} else {
+			end = second.Add(time.Second - time.Millisecond)
 		}
-		next, err := e.GetAccountTradeList(ctx, pair, orderID, start, end, accountTradesPageLimit)
-		if err != nil {
+		from := start
+		if !from.Before(end) {
+			from = time.Time{}
+		}
+		var err error
+		if page, err = e.GetAccountTradeList(ctx, pair, orderID, from, end, accountTradesPageLimit); err != nil {
 			log.Warnf(log.ExchangeSys, "%s: myTrades lookup failed for order %s (%s) after %d fills: %v", e.Name, orderID, pair, len(fills), err)
 			break
 		}
-		if len(next) >= accountTradesPageLimit {
-			reached := false
-			for _, f := range next {
-				if f.Time.Time().Before(oldest.Truncate(time.Second)) {
-					reached = true
-					break
-				}
-			}
-			if !reached {
-				log.Warnf(log.ExchangeSys, "%s: order %s (%s) has more fills in the second at %s than a myTrades page holds; commission covers %d fills", e.Name, orderID, pair, oldest.Truncate(time.Second), len(fills))
-				break
-			}
-		}
-		page = next
 	}
 	var filled decimal.Decimal
 	for _, f := range fills {
@@ -999,6 +1018,10 @@ func (e *Exchange) tradesForOrder(ctx context.Context, pair currency.Pair, order
 	}
 	trades = make([]order.TradeHistory, 0, len(fills))
 	uniformFee := true
+	// charged records whether any fill was charged a commission, and unchargedAsset is the asset the fills
+	// name when none was, unless they name different ones
+	var charged, unchargedMixed bool
+	var unchargedAsset currency.Code
 	for _, f := range fills {
 		side := order.Buy
 		if !f.IsBuyer {
@@ -1007,7 +1030,15 @@ func (e *Exchange) tradesForOrder(ctx context.Context, pair currency.Pair, order
 		fillAsset := f.CommissionAsset
 		totalFee += f.Commission.Float64()
 		switch {
-		case feeAsset.IsEmpty():
+		case f.Commission.Float64() == 0:
+			// A fill charged nothing adds nothing in any asset, so it only names the fee asset when no fill was charged
+			if unchargedAsset.IsEmpty() {
+				unchargedAsset = fillAsset
+			} else if !fillAsset.IsEmpty() && !unchargedAsset.Equal(fillAsset) {
+				unchargedMixed = true
+			}
+		case !charged:
+			charged = true
 			feeAsset = fillAsset
 		case !feeAsset.Equal(fillAsset):
 			uniformFee = false
@@ -1024,6 +1055,9 @@ func (e *Exchange) tradesForOrder(ctx context.Context, pair currency.Pair, order
 			FeeAsset:  f.CommissionAsset.String(),
 			Total:     f.QuoteQuantity.Float64(),
 		})
+	}
+	if !charged && !unchargedMixed {
+		feeAsset = unchargedAsset
 	}
 	if !uniformFee {
 		// Commissions charged in different assets cannot be summed into a single figure: the total
@@ -1080,6 +1114,7 @@ func (e *Exchange) GetOrderInfo(ctx context.Context, orderID string, pair curren
 			// Detail.Cost to the proto cost field, so a market order's real executed cost reaches
 			// the caller instead of a zero. Price alone is the protective limit, not the average.
 			Cost:                 result.CummulativeQuoteQty.Float64(),
+			CostAsset:            pair.Quote,
 			AverageExecutedPrice: averageExecutedPrice(result),
 			TriggerPrice:         result.StopPrice.Float64(),
 			ExecutedAmount:       result.ExecutedQty.Float64(),
@@ -1240,6 +1275,7 @@ func (e *Exchange) orderDetailFromRESTOrder(o *OrderDetail, fallbackPair currenc
 		// Cost is the quote actually spent (cumulative filled value), mapped to the proto cost
 		// field by the rpc server; without it a market order reports a zero cost to the caller.
 		Cost:            o.CummulativeQuoteQty.Float64(),
+		CostAsset:       pair.Quote,
 		ExecutedAmount:  o.ExecutedQty.Float64(),
 		RemainingAmount: o.OrigQty.Float64() - o.ExecutedQty.Float64(),
 		Exchange:        e.Name,
@@ -1337,6 +1373,13 @@ func (e *Exchange) GetFeeByType(ctx context.Context, feeBuilder *exchange.FeeBui
 	// returning the bare rate reported e.g. 0.0005 as if it were the fee. The offline branch is the
 	// same calculation against a fixed worst-case rate, used when no credentials are available to ask
 	// the exchange for the account's own schedule.
+	if err := common.NilGuard(feeBuilder); err != nil {
+		return 0, err
+	}
+	// The account's own rates need credentials; without them the offline estimate is the best answer.
+	if feeBuilder.FeeType == exchange.CryptocurrencyTradeFee && !e.AreCredentialsValid(ctx) {
+		feeBuilder.FeeType = exchange.OfflineTradeFee
+	}
 	switch feeBuilder.FeeType {
 	case exchange.OfflineTradeFee:
 		if feeBuilder.IsMaker {

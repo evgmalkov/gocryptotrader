@@ -162,7 +162,7 @@ func (s *wsMockServer) serve(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case drop:
 				case reject:
-					mc.write(`{"id":` + itoa(req.ID) + `,"code":0,"msg":"Not Subscribed successfully! [` + p + `].  Reason： Blocked! "}`)
+					mc.write(`{"id":` + itoa(req.ID) + `,"code":0,"msg":"Not Subscribed successfully! [` + p + `].  Reason: Blocked! "}`)
 				default:
 					mc.write(`{"id":` + itoa(req.ID) + `,"code":0,"msg":"` + p + `"}`)
 				}
@@ -483,18 +483,22 @@ func TestKeepListenKeyAliveReleasesPromptlyWhenItsConnectionCloses(t *testing.T)
 	assert.Equal(t, []string{"KEY_A"}, closed, "the renewer should close its listen key")
 }
 
-// TestWsRollbackDoesNotHoldListenKeys keeps a second connection of an authenticated websocket failing, so
-// every monitor cycle opens the first connection with a fresh listen key and then rolls it back. Once the
-// venue accepts both, the account must hold only the two keys in use. Renewers that noticed a rolled-back
-// connection only at their next renewal kept one key per failed cycle for half an hour, and the venue caps
-// the keys an account may hold.
+// TestWsRollbackDoesNotHoldListenKeys keeps a second private connection of an authenticated websocket
+// failing, so every monitor cycle opens the first one with a fresh listen key and then rolls it back. Once
+// the venue accepts both, the account must hold only the two keys in use. Renewers that noticed a
+// rolled-back connection only at their next renewal kept one key per failed cycle for half an hour, and the
+// venue caps the keys an account may hold. Only private connections take a key, so the private channels are
+// spread over two of them.
 func TestWsRollbackDoesNotHoldListenKeys(t *testing.T) {
 	t.Parallel()
 	srv := newWsMockServer(t)
 	var refusing atomic.Bool
 	refusing.Store(true)
 	srv.refuse = func(open int32) bool { return refusing.Load() && open >= 1 }
-	ex := newWsLifecycleExchange(t, srv.wsURL(), wsLifecycleDepthSubs(), nil)
+	ex := newWsLifecycleExchange(t, srv.wsURL(), subscription.List{
+		{Enabled: true, Asset: asset.Spot, Channel: subscription.MyOrdersChannel, Authenticated: true},
+		{Enabled: true, Asset: asset.Spot, Channel: subscription.MyTradesChannel, Authenticated: true},
+	}, nil)
 	ex.Websocket.MaxSubscriptionsPerConnection = 1
 	ledger := withListenKeyREST(t, ex)
 

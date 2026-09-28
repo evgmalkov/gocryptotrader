@@ -19,6 +19,7 @@ import (
 	gws "github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/thrasher-corp/gocryptotrader/common"
 	"github.com/thrasher-corp/gocryptotrader/common/crypto"
 	"github.com/thrasher-corp/gocryptotrader/currency"
 	"github.com/thrasher-corp/gocryptotrader/encoding/json"
@@ -240,7 +241,7 @@ func TestSubmitOrderPairFromRequest(t *testing.T) {
 
 // TestSubmitOrderPlacedWhenStatusAbsent covers MEXC's create-order ACK, which carries an orderId but
 // no status field (unlike Binance). A populated OrderID from a successful NewOrder means the order was
-// placed, so the response must report a placed status and WasOrderPlaced() must be true — otherwise a
+// placed, so the response must report a placed status and WasOrderPlaced() must be true; otherwise a
 // filled market order is mis-read as never placed.
 func TestSubmitOrderPlacedWhenStatusAbsent(t *testing.T) {
 	t.Parallel()
@@ -283,6 +284,7 @@ func TestGetOrderInfoPairAndTimestamps(t *testing.T) {
 		assert.Equal(t, int64(1736409765000), detail.Date.UnixMilli(), "Date should come from the order time")
 		assert.Equal(t, int64(1736409770000), detail.LastUpdated.UnixMilli(), "LastUpdated should come from updateTime")
 		assert.Equal(t, 10.0, detail.Cost, "Cost should carry the cumulative quote spent, not a zero")
+		assert.Equal(t, currency.USDT, detail.CostAsset, "CostAsset should be the quote currency")
 	})
 
 	t.Run("updateTime absent falls back to time", func(t *testing.T) {
@@ -355,6 +357,7 @@ func TestGetActiveOrdersToleratesUncatalogedSymbol(t *testing.T) {
 		if orders[i].OrderID == "b1" {
 			found = true
 			assert.Equal(t, 20000.0, orders[i].Cost, "Cost should carry the cumulative quote spent from the REST order")
+			assert.Equal(t, currency.USDT, orders[i].CostAsset, "CostAsset should be the quote currency")
 		}
 	}
 	assert.True(t, found, "the catalogued BTCUSDT order should be present in the listing")
@@ -689,10 +692,31 @@ func TestGetOrderInfoAverageExecutedPrice(t *testing.T) {
 	assert.Equal(t, 0.183503, detail.Price, "Price should still carry the reported price field")
 }
 
+// TestGetFeeByTypeWithoutCredentials estimates a trade fee offline when there are no credentials to read the
+// account's own rates with, rather than failing on the authenticated request.
+func TestGetFeeByTypeWithoutCredentials(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int64
+	ex := newSignedTestExchange(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls.Add(1) }))
+	ex.SetCredentials(&accounts.Credentials{})
+	fee, err := ex.GetFeeByType(t.Context(), &exchange.FeeBuilder{
+		FeeType:       exchange.CryptocurrencyTradeFee,
+		Pair:          currency.NewPair(currency.NewCode("KAS"), currency.USDT),
+		PurchasePrice: 50000,
+		Amount:        0.5,
+	})
+	require.NoError(t, err, "GetFeeByType must not error without credentials")
+	assert.InDelta(t, 12.5, fee, 1e-9, "Fee should be the offline taker estimate")
+	assert.Zero(t, calls.Load(), "no request should be made without credentials")
+
+	_, err = ex.GetFeeByType(t.Context(), nil)
+	assert.ErrorIs(t, err, common.ErrNilPointer, "GetFeeByType should error on a nil fee builder")
+}
+
 // TestGetOrderInfoEnrichesVenueFee asserts GetOrderInfo reads the commission facts from myTrades for a
 // filled order: the Query Order response carries no commission, so the fee amount and its currency come
 // from the fills. The fee currency is taken from the fill (MEXC may charge in base, quote, or the MX
-// token), never assumed, and is left unset when fills disagree.
+// token), never assumed, and is left unset when the fills charged a commission disagree on it.
 func TestGetOrderInfoEnrichesVenueFee(t *testing.T) {
 	t.Parallel()
 	kas := currency.NewPair(currency.NewCode("KAS"), currency.USDT)
@@ -712,7 +736,7 @@ func TestGetOrderInfoEnrichesVenueFee(t *testing.T) {
 	t.Run("uniform commission asset aggregates fee and currency", func(t *testing.T) {
 		t.Parallel()
 		orderBody := filledSpotOrderBody
-		// clientOrderId is a string on MEXC (e.g. "C02__…"), not a number — the fixture pins the
+		// clientOrderId is a string on MEXC (e.g. "C02__1"), not a number; the fixture pins the
 		// decode contract so a numeric field type would fail here.
 		tradesBody := `[{"symbol":"KASUSDT","id":"t1","orderId":"1","clientOrderId":"C02__1","commission":"0.0035","commissionAsset":"USDT","isBuyer":false,"isMaker":true,"price":"0.035","qty":"100","quoteQty":"3.5","time":1736409770000},{"symbol":"KASUSDT","id":"t2","orderId":"1","clientOrderId":"C02__1","commission":"0.0035","commissionAsset":"USDT","isBuyer":false,"isMaker":false,"price":"0.035","qty":"100","quoteQty":"3.5","time":1736409770500}]`
 		e := newSignedTestExchange(t, routeVenue(orderBody, tradesBody))
@@ -737,6 +761,26 @@ func TestGetOrderInfoEnrichesVenueFee(t *testing.T) {
 		assert.InDelta(t, 0.0035, detail.Trades[0].Fee, 1e-9, "the per-fill commission should still be reported")
 		assert.Equal(t, "USDT", detail.Trades[0].FeeAsset, "the per-fill commission asset should still be reported")
 		assert.Equal(t, "MX", detail.Trades[1].FeeAsset, "the per-fill commission asset should still be reported")
+	})
+
+	t.Run("a fill charged nothing has no say in the fee asset", func(t *testing.T) {
+		t.Parallel()
+		tradesBody := `[{"symbol":"KASUSDT","id":"t1","orderId":"1","commission":"0.0035","commissionAsset":"USDT","price":"0.035","qty":"100","quoteQty":"3.5","time":1736409770000},{"symbol":"KASUSDT","id":"t2","orderId":"1","commission":"0","commissionAsset":"MX","price":"0.035","qty":"100","quoteQty":"3.5","time":1736409770500}]`
+		e := newSignedTestExchange(t, routeVenue(filledSpotOrderBody, tradesBody))
+		detail, err := e.GetOrderInfo(t.Context(), "1", kas, asset.Spot)
+		require.NoError(t, err, "GetOrderInfo must not error")
+		assert.InDelta(t, 0.0035, detail.Fee, 1e-9, "Fee should be the commission of the fill charged")
+		assert.Equal(t, currency.USDT, detail.FeeAsset, "FeeAsset should be the asset of the fill charged")
+	})
+
+	t.Run("fills charged nothing keep their asset", func(t *testing.T) {
+		t.Parallel()
+		tradesBody := `[{"symbol":"KASUSDT","id":"t1","orderId":"1","commission":"0","commissionAsset":"USDT","price":"0.035","qty":"100","quoteQty":"3.5","time":1736409770000},{"symbol":"KASUSDT","id":"t2","orderId":"1","commission":"0","commissionAsset":"USDT","price":"0.035","qty":"100","quoteQty":"3.5","time":1736409770500}]`
+		e := newSignedTestExchange(t, routeVenue(filledSpotOrderBody, tradesBody))
+		detail, err := e.GetOrderInfo(t.Context(), "1", kas, asset.Spot)
+		require.NoError(t, err, "GetOrderInfo must not error")
+		assert.Zero(t, detail.Fee, "Fee should be zero when no fill was charged")
+		assert.Equal(t, currency.USDT, detail.FeeAsset, "FeeAsset should be the asset the fills name")
 	})
 
 	t.Run("no fills leaves fee unenriched without a trade call", func(t *testing.T) {
@@ -982,10 +1026,9 @@ func TestGenerateBrokerSubAccountDepositAddressRequestBody(t *testing.T) {
 	assert.JSONEq(t, `{"coin":"USDT","network":"TRC20"}`, string(body), "the body should carry coin and network")
 }
 
-// TestKeepListenKeyAliveRenewsEachConnectionsOwnKey asserts that when subscriptions span more than one
-// connection each connection's renewer renews its own listen key, not a shared last-minted slot, so no
-// stream's key is left to expire. Reverting the renewer to a single shared key renews only one of the
-// two here.
+// TestKeepListenKeyAliveRenewsEachConnectionsOwnKey asserts that each keyed connection's renewer renews its
+// own listen key, not a shared last-minted slot, so no stream's key is left to expire. Reverting the
+// renewer to a single shared key renews only one of the two here.
 func TestKeepListenKeyAliveRenewsEachConnectionsOwnKey(t *testing.T) {
 	prev := listenKeyKeepAliveInterval
 	listenKeyKeepAliveInterval = 5 * time.Millisecond
@@ -1012,7 +1055,7 @@ func TestKeepListenKeyAliveRenewsEachConnectionsOwnKey(t *testing.T) {
 	ex.Websocket.Wg.Wait()
 }
 
-// listenKeyTestConn stands in for a manager connection: WsConnect dials it, and its renewer asks whether
+// listenKeyTestConn stands in for a manager connection: a connector dials it, and its renewer asks whether
 // it is still connected.
 type listenKeyTestConn struct {
 	websocket.Connection
@@ -1047,7 +1090,7 @@ func TestKeepListenKeyAliveStopsWithItsConnection(t *testing.T) {
 	}))
 	ex.Websocket.SetCanUseAuthenticatedEndpoints(true)
 	conn := &listenKeyTestConn{url: "wss://one"}
-	require.NoError(t, ex.WsConnect(t.Context(), conn), "WsConnect must not error")
+	require.NoError(t, ex.wsConnectPrivate(t.Context(), conn), "wsConnectPrivate must not error")
 	assert.Equal(t, "wss://one?listenKey=key-1", conn.url, "the connection should dial with its listen key")
 	require.Eventually(t, func() bool { return renewed.Load() > 0 }, time.Second, 5*time.Millisecond, "the key must be renewed while its connection is open")
 
@@ -1511,9 +1554,9 @@ func (c *failingDialConn) Dial(context.Context, *gws.Dialer, http.Header, url.Va
 	return errors.New("dial refused")
 }
 
-// TestWsConnectReleasesListenKeyOnFailedDial releases the listen key minted for a connection whose dial
-// fails: no renewer owns it yet, and the monitor retries a failed connect every few seconds.
-func TestWsConnectReleasesListenKeyOnFailedDial(t *testing.T) {
+// TestWsConnectPrivateReleasesListenKeyOnFailedDial releases the listen key minted for a connection whose
+// dial fails: no renewer owns it yet, and the monitor retries a failed connect every few seconds.
+func TestWsConnectPrivateReleasesListenKeyOnFailedDial(t *testing.T) {
 	t.Parallel()
 	keys := []string{"KEY_A", "KEY_B", "KEY_C"}
 	var mu sync.Mutex
@@ -1533,12 +1576,150 @@ func TestWsConnectReleasesListenKeyOnFailedDial(t *testing.T) {
 	}))
 	ex.Websocket.SetCanUseAuthenticatedEndpoints(true)
 	for range 3 {
-		assert.Error(t, ex.WsConnect(t.Context(), &failingDialConn{url: spotWebsocketURL}), "WsConnect should report the failed dial")
+		assert.Error(t, ex.wsConnectPrivate(t.Context(), &failingDialConn{url: spotWebsocketURL}), "wsConnectPrivate should report the failed dial")
 	}
 	mu.Lock()
 	defer mu.Unlock()
 	require.Len(t, minted, 3, "each attempt must mint a listen key")
 	assert.Equal(t, minted, closed, "each minted listen key should be released when its dial fails")
+}
+
+// TestWsConnectPublicConnectionsTakeNoListenKey dials a public connection without a listen key. The venue
+// holds 60 keys per account, so a key minted for every connection ran out once the subscriptions needed
+// more than 60 connections, and no connection could then be made.
+func TestWsConnectPublicConnectionsTakeNoListenKey(t *testing.T) {
+	t.Parallel()
+	var minted atomic.Int64
+	ex := newSignedTestExchange(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			minted.Add(1)
+		}
+		_, _ = w.Write([]byte(`{"listenKey":"key-1"}`))
+	}))
+	ex.Websocket.SetCanUseAuthenticatedEndpoints(true)
+	conn := &listenKeyTestConn{url: "wss://one"}
+	require.NoError(t, ex.WsConnect(t.Context(), conn), "WsConnect must not error")
+	assert.Equal(t, "wss://one", conn.url, "a public connection should dial without a listen key")
+	assert.Zero(t, minted.Load(), "a public connection should not mint a listen key")
+}
+
+// TestGenerateSubscriptionsSplitsPrivateChannels puts the private channels on the connection that takes
+// the listen key and the public ones on the connections that take none.
+func TestGenerateSubscriptionsSplitsPrivateChannels(t *testing.T) {
+	t.Parallel()
+	ex := newSignedTestExchange(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	ex.Websocket.SetCanUseAuthenticatedEndpoints(true)
+	all, err := ex.generateSubscriptions()
+	require.NoError(t, err, "generateSubscriptions must not error")
+	public, err := ex.generatePublicSubscriptions()
+	require.NoError(t, err, "generatePublicSubscriptions must not error")
+	private, err := ex.generatePrivateSubscriptions()
+	require.NoError(t, err, "generatePrivateSubscriptions must not error")
+	require.NotEmpty(t, public, "the public channels must be subscribed")
+	require.NotEmpty(t, private, "the private channels must be subscribed")
+	assert.Len(t, all, len(public)+len(private), "every channel should be on one connection or the other")
+	for _, s := range public {
+		assert.Falsef(t, isPrivateChannel(s), "%s should be public to go on a public connection", s.QualifiedChannel)
+	}
+	for _, s := range private {
+		assert.Truef(t, isPrivateChannel(s), "%s should be private to go on the private connection", s.QualifiedChannel)
+	}
+
+	// A configured private channel need not carry the Authenticated flag, and is only served with the key
+	ex.Features.Subscriptions = subscription.List{{Enabled: true, Asset: asset.Spot, Channel: subscription.MyOrdersChannel}}
+	private, err = ex.generatePrivateSubscriptions()
+	require.NoError(t, err, "generatePrivateSubscriptions must not error")
+	require.Len(t, private, 1, "a private channel configured without the Authenticated flag must still be subscribed")
+	assert.Equal(t, "spot@"+channelPrivateOrdersAPI, private[0].QualifiedChannel, "the private orders channel should be on the private connection")
+
+	// An already expanded subscription is passed through as it is, so it is placed by its qualified channel
+	ex.Features.Subscriptions = subscription.List{{Enabled: true, Asset: asset.Spot, QualifiedChannel: "spot@" + channelPrivateDealsV3}}
+	private, err = ex.generatePrivateSubscriptions()
+	require.NoError(t, err, "generatePrivateSubscriptions must not error")
+	assert.Len(t, private, 1, "an expanded private subscription should be on the private connection")
+
+	ex.Websocket.SetCanUseAuthenticatedEndpoints(false)
+	private, err = ex.generatePrivateSubscriptions()
+	require.NoError(t, err, "generatePrivateSubscriptions must not error")
+	assert.Empty(t, private, "no private channel should be subscribed without the authenticated websocket")
+}
+
+// TestWebsocketTakesOneListenKeyForThePrivateChannels connects through the websocket manager to a local
+// venue: the private channels must go over the one connection dialled with a listen key, and the public
+// channels over connections dialled without one.
+func TestWebsocketTakesOneListenKeyForThePrivateChannels(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	var minted int
+	// keyed records, for each channel subscribed, whether each subscription went over a connection with a key
+	keyed := make(map[string][]bool)
+	var upgrader gws.Upgrader
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "userDataStream") {
+			mu.Lock()
+			if r.Method == http.MethodPost {
+				minted++
+			}
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"listenKey":"key-1"}`))
+			return
+		}
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		withKey := r.URL.Query().Get("listenKey") != ""
+		go func() {
+			defer c.Close()
+			for {
+				_, msg, err := c.ReadMessage()
+				if err != nil {
+					return
+				}
+				var req WsSubscriptionPayload
+				if json.Unmarshal(msg, &req) != nil || req.Method != "SUBSCRIPTION" || len(req.Params) != 1 {
+					continue
+				}
+				mu.Lock()
+				keyed[req.Params[0]] = append(keyed[req.Params[0]], withKey)
+				mu.Unlock()
+				resp, err := json.Marshal(&WsSubscriptionResponse{ID: req.ID, Message: req.Params[0]})
+				if err != nil || c.WriteMessage(gws.TextMessage, resp) != nil {
+					return
+				}
+			}
+		}()
+	}))
+	t.Cleanup(srv.Close)
+
+	ex := new(Exchange)
+	require.NoError(t, testexch.Setup(ex), "Setup must not error")
+	ex.Name = t.Name()
+	ex.SetCredentials(&accounts.Credentials{Key: testCredentialKey, Secret: testCredentialSecret})
+	ex.SkipAuthCheck = true
+	require.NoError(t, ex.SetHTTPClient(srv.Client()), "SetHTTPClient must not error")
+	require.NoError(t, ex.API.Endpoints.SetRunningURL(exchange.RestSpot.String(), srv.URL), "SetRunningURL must not error")
+	ex.API.AuthenticatedWebsocketSupport = true
+	ex.Websocket.SetCanUseAuthenticatedEndpoints(true)
+	require.NoError(t, ex.Websocket.SetAllConnectionURLs("ws"+strings.TrimPrefix(srv.URL, "http")), "SetAllConnectionURLs must not error")
+	ex.Features.Subscriptions = subscription.List{
+		{Enabled: true, Asset: asset.Spot, Channel: channelMiniTickerV3},
+		{Enabled: true, Asset: asset.Spot, Channel: subscription.MyOrdersChannel, Authenticated: true},
+	}
+	require.NoError(t, ex.Websocket.Connect(t.Context()), "Connect must not error")
+	t.Cleanup(func() { assert.NoError(t, ex.Websocket.Shutdown(), "Shutdown should not error") })
+
+	subs, err := ex.generateSubscriptions()
+	require.NoError(t, err, "generateSubscriptions must not error")
+	want := make(map[string][]bool, len(subs))
+	for _, s := range subs {
+		want[s.QualifiedChannel] = []bool{strings.Contains(s.QualifiedChannel, "@private.")}
+	}
+	require.Contains(t, want, "spot@"+channelPrivateOrdersAPI, "the private orders channel must be configured")
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, 1, minted, "one listen key should be minted, for the private connection")
+	assert.Equal(t, want, keyed, "each channel should be subscribed once, over a connection with a listen key only if it is private")
 }
 
 // TestCreateBatchOrderMarketParameters applies the single-order market rules to each batch entry: no
@@ -1614,7 +1795,7 @@ func TestHandleSubscriptionKeepsAcceptedWhenOneIsRejected(t *testing.T) {
 	refused := &subscription.Subscription{Channel: channelLimitDepthV3, Asset: asset.Spot, Pairs: currency.Pairs{currency.NewPair(currency.ETH, currency.USDT)}, Levels: 50, QualifiedChannel: "spot@public.limit.depth.v3.api.pb@ETHUSDT@50"}
 	conn := &subscriptionTestConn{replies: map[string]string{
 		accepted.QualifiedChannel: `{"id":0,"code":0,"msg":"` + accepted.QualifiedChannel + `"}`,
-		refused.QualifiedChannel:  `{"id":0,"code":0,"msg":"Not Subscribed successfully! [` + refused.QualifiedChannel + `]. Reason： Blocked!"}`,
+		refused.QualifiedChannel:  `{"id":0,"code":0,"msg":"Not Subscribed successfully! [` + refused.QualifiedChannel + `]. Reason: Blocked!"}`,
 	}}
 	err := ex.handleSubscription(t.Context(), conn, "SUBSCRIPTION", subscription.List{accepted, refused})
 	require.ErrorIs(t, err, websocket.ErrSubscriptionFailure, "a rejected subscription must be reported")
@@ -1811,15 +1992,15 @@ func TestDustConvertJoinsAssets(t *testing.T) {
 // TestGetOrderInfoReadsEveryFillPage reads the commission of an order with more fills than one myTrades
 // request returns. The venue answers myTrades with at most limit fills, newest first, stamped to the
 // second and with string ids that do not follow the fills' order, and reads startTime and endTime to
-// the millisecond.
+// the millisecond. The order's time carries milliseconds.
 func TestGetOrderInfoReadsEveryFillPage(t *testing.T) {
 	t.Parallel()
-	created := time.Date(2026, 9, 25, 10, 0, 0, 0, time.UTC)
+	created := time.Date(2026, 9, 25, 10, 0, 0, 366*int(time.Millisecond), time.UTC)
 	for _, tc := range []struct {
 		name      string
 		fills     int
 		perSecond int
-		// wantFee is the commission read when the fills can all be read, or zero when they can't
+		// wantFee is the commission of the fills that can be read, or zero when the page cap stops the read
 		wantFee float64
 		// maxCalls is the most myTrades requests the read should take
 		maxCalls int64
@@ -1827,15 +2008,19 @@ func TestGetOrderInfoReadsEveryFillPage(t *testing.T) {
 		{"1001 fills", 1001, 3, 1001, accountTradesMaxPages},
 		{"2500 fills", 2500, 3, 2500, accountTradesMaxPages},
 		{"pages meeting part-way through a second", 1500, 600, 1500, accountTradesMaxPages},
-		// Reading the second again returns the same page, so the read stops there.
-		{"more fills in one second than a page", 1500, 1500, 0, 2},
+		// Only a page of the fills in a second holding more than a page can be read.
+		{"more fills in one second than a page", 1500, 1500, 1000, 2},
+		{"seconds holding a page each", 2500, 1000, 2500, accountTradesMaxPages},
+		{"seconds holding more than a page each", 2500, 1200, 2100, accountTradesMaxPages},
 		{"more pages than are read", 30000, 10, 0, accountTradesMaxPages},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			// Fill i is stamped perSecond fills to a second from the order's creation, charged 1 USDT for
-			// 1 KAS, and its id is scrambled so that it does not follow the fills' order.
-			stamp := func(i int) int64 { return created.Add(time.Duration(i/tc.perSecond+1) * time.Second).UnixMilli() }
+			// Fill i is stamped perSecond fills to a second from the second the order was created in, charged
+			// 1 USDT for 1 KAS, and its id is scrambled so that it does not follow the fills' order.
+			stamp := func(i int) int64 {
+				return created.Truncate(time.Second).Add(time.Duration(i/tc.perSecond) * time.Second).UnixMilli()
+			}
 			id := func(i int) string { return strconv.Itoa(i*7919%100003) + "X" + strconv.Itoa(i%3) }
 			var calls atomic.Int64
 			ex := newSignedTestExchange(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1874,11 +2059,34 @@ func TestGetOrderInfoReadsEveryFillPage(t *testing.T) {
 				assert.Equal(t, float64(len(detail.Trades)), detail.Fee, "the fee should be the commission of the fills that were read, each once")
 				return
 			}
-			require.Len(t, detail.Trades, tc.fills, "every fill must be read once")
-			assert.Equal(t, tc.wantFee, detail.Fee, "Fee should be the commission of every fill")
+			require.Len(t, detail.Trades, int(tc.wantFee), "every fill that can be read must be read once")
+			assert.Equal(t, tc.wantFee, detail.Fee, "Fee should be the commission of every fill read")
 			assert.Equal(t, currency.USDT, detail.FeeAsset, "FeeAsset should be the fills' commission asset")
 		})
 	}
+}
+
+// TestGetOrderInfoStopsWhenTheWindowIsIgnored stops reading an order's fills when myTrades answers a
+// windowed read with fills outside the window, rather than reading the same page up to the request bound.
+func TestGetOrderInfoStopsWhenTheWindowIsIgnored(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int64
+	ex := newSignedTestExchange(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "myTrades") {
+			_, _ = w.Write([]byte(`{"symbol":"KASUSDT","orderId":"1","origQty":"3000","executedQty":"3000","type":"LIMIT","side":"SELL","status":"FILLED","time":1790330400366}`))
+			return
+		}
+		calls.Add(1)
+		rows := make([]string, 0, accountTradesPageLimit)
+		for i := 2999; i >= 2000; i-- {
+			rows = append(rows, `{"id":"`+strconv.Itoa(i)+`","orderId":"1","commission":"1","commissionAsset":"USDT","qty":"1","time":`+strconv.FormatInt(1790330400000+int64(i/3)*1000, 10)+`}`)
+		}
+		_, _ = w.Write([]byte("[" + strings.Join(rows, ",") + "]"))
+	}))
+	detail, err := ex.GetOrderInfo(t.Context(), "1", currency.NewPair(currency.NewCode("KAS"), currency.USDT), asset.Spot)
+	require.NoError(t, err, "GetOrderInfo must not error")
+	assert.Len(t, detail.Trades, accountTradesPageLimit, "the fills read before the window was ignored should be kept")
+	assert.Equal(t, int64(2), calls.Load(), "a page answered outside its window should end the reads")
 }
 
 // TestGetOrderHistoryAsksForAFullPage asks the venue for its largest page of orders: All Orders returns
